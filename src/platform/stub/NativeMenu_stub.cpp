@@ -8,6 +8,7 @@
 // pattern is that CMakeLists.txt picks which src/platform/<platform>/ file
 // to compile, and every platform provides the same functions, so the rest
 // of the engine can call them unconditionally.
-void SetupNativeFileMenu(void (*)(const char* path), void (*)(const char* path)) {}
+void SetupNativeFileMenu(void (*)(), void (*)(const char* path), void (*)(const char* path)) {}
+void TriggerNew() {}
 void TriggerSaveDialog() {}
 bool TriggerOpenDialog() { return false; }

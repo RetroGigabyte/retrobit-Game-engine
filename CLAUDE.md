@@ -130,11 +130,19 @@ editing so the world doesn't drift out from under you.
 - `T` — switch the gizmo to **Scale** (toggles back to Move on a second press).
 - Drag the gizmo (arrows in Move, rings in Rotate, small cubes in Scale) to edit
   the selected part.
+- `M` — open the **spawn menu** (works locked or unlocked; automatically unlocks the
+  mouse so you can click immediately). Two buttons — **BOX**/`1` and **SPHERE**/`2` —
+  spawn a new part 8 units in front of wherever the freecam is looking (floored so it
+  doesn't land underground), auto-selected and in Move mode so you can reposition it
+  right away. Press `M` again to close without spawning.
 - The window title bar doubles as a debug HUD while in edit mode: shows lock
-  state, current tool mode, `selected=<part index>`, `drag=<axis>`, and `LMB=`.
-- `Cmd+S` / `Cmd+O` (would be `Ctrl+S` / `Ctrl+O` on a non-Apple build, see below) —
-  save/open the level via native dialogs. Work globally, not just in edit mode. Opening
-  a level clears the current selection (part indices may not mean the same thing).
+  state, current tool mode, `selected=<part index>`, `drag=<axis>`, and `LMB=` — or,
+  while the spawn menu is open, just that.
+- `Cmd+N` / `Cmd+S` / `Cmd+O` (would be `Ctrl+N` / `Ctrl+S` / `Ctrl+O` on a non-Apple
+  build, see below) — new/save/open. Work globally, not just in edit mode. New
+  unconditionally resets to the Playground preset and (re)enters play, even mid-game —
+  unlike Open, there's no dialog/cancel to account for. Save/Open use native dialogs;
+  Open clears the current selection (part indices may not mean the same thing).
 
 ## What's implemented
 
@@ -164,6 +172,23 @@ editing so the world doesn't drift out from under you.
   Hills has no flat-plane fallback at all, so its terrain triangles are the only thing
   holding the player up, and walking off the generated grid's edge is a real void-fall,
   same as walking off the Playground checkerboard.
+- **Spawn menu** (`M` in edit mode, `g_spawnMenuOpen`): a small ortho-overlay menu
+  (BOX/SPHERE, click or `1`/`2`) for adding new parts without hand-editing code. Reuses
+  the same collide-and-slide/gizmo system every other part uses — a spawned part is a
+  normal `Part`, just constructed at runtime instead of hardcoded in `main()`. The
+  `drawButton`/`drawText` ortho-UI lambdas used to render it (and the title screen's
+  buttons) are defined once, before the main loop, specifically so both screens could
+  share them without duplicating the quad/font-drawing logic.
+  - **Collision is always an oriented box**, regardless of which mesh is spawned —
+    `buildBoxTriangles`/`rayHitsPart` both work purely off `Part::size`, so a spawned
+    sphere looks round but collides like its bounding box. A true sphere collider
+    would need its own resolver; deferred as a known simplification, not a bug.
+  - **Shape doesn't survive save/load** — the `.retrobitl` format only stores
+    position/size/color/rotation, not which mesh a part uses, so `loadLevelFromFile`
+    always points loaded parts at the box mesh (`g_partMeshForLoad`). A saved sphere
+    part will reload looking like a box (still collides identically either way, since
+    collision was already box-shaped). Extending the format with a shape ID is the
+    fix, not attempted here.
 - Window/GL context + render loop (`src/main.cpp`), explicit `glViewport` set from
   `glfwGetFramebufferSize` at startup (previously relied on driver defaults)
 - Basic forward-shaded pipeline: `Shader` class, `basic.vert`/`basic.frag` with
@@ -207,19 +232,24 @@ editing so the world doesn't drift out from under you.
     Roblox's face-resize behavior; size is clamped to a minimum to avoid inverting
   - Collision triangles rebuild every frame from live part transforms, so moved,
     rotated, and resized parts all collide correctly immediately
-- **Level save/open** (`.retrobitl` files): `File > Save`/`Open…` in the native macOS
-  menu bar, or `Cmd+S`/`Cmd+O`, use an `NSSavePanel`/`NSOpenPanel` to write/read the
-  `parts` vector. Format is plain text (`RETROBITLEVEL 1` header, part count, then one
+- **Level new/save/open** (`.retrobitl` files): `File > New`/`Save…`/`Open…` in the
+  native macOS menu bar, or `Cmd+N`/`Cmd+S`/`Cmd+O`. Save/Open use an
+  `NSSavePanel`/`NSOpenPanel` to write/read the `parts` vector; New has no dialog, it
+  just resets. Format is plain text (`RETROBITLEVEL 1` header, part count, then one
   line per part: position, size, color, rotation quaternion) — human-readable on
   purpose, since there's no tooling to inspect a binary format yet.
-  - `src/NativeMenu.mm` / `include/NativeMenu.h`: GLFW has no menu-bar API, so this is
-    hand-written Cocoa (`NSMenu`/`NSMenuItem`/`NSSavePanel`/`NSOpenPanel`), built as
-    Objective-C++ and gated behind `if(APPLE)` in `CMakeLists.txt` (`project(... OBJCXX)`,
-    `file(GLOB ... src/*.mm)`). Exposes `SetupNativeFileMenu(onSaveWithPath,
-    onOpenWithPath)` plus `TriggerSaveDialog()`/`TriggerOpenDialog()` — the latter two
-    are also called directly from `keyCallback` on `Cmd+S`/`Cmd+O` (`Ctrl+S`/`Ctrl+O` on
-    the `#else` non-Apple branch, which doesn't build yet — see below) so the shortcuts
-    work without going through the menu.
+  - `src/platform/macos/NativeMenu.mm` / `include/NativeMenu.h` (see the Platform
+    support section below for why this lives under `src/platform/`): GLFW has no
+    menu-bar API, so this is hand-written Cocoa (`NSMenu`/`NSMenuItem`/
+    `NSSavePanel`/`NSOpenPanel`), built as Objective-C++. Exposes
+    `SetupNativeFileMenu(onNew, onSaveWithPath, onOpenWithPath)` plus
+    `TriggerNew()`/`TriggerSaveDialog()`/`TriggerOpenDialog()` — all three are also
+    called directly from `keyCallback` on `Cmd+N`/`Cmd+S`/`Cmd+O` (`Ctrl+N`/`Ctrl+S`/
+    `Ctrl+O` on the `#else` non-Apple branch, which doesn't build yet) so the
+    shortcuts work without going through the menu. `main.cpp` wires New through
+    `g_newSceneFn`/`triggerNewScene()` the same `std::function`-indirection pattern
+    used for `g_enterPlayModeFn`, since the native callback is a plain function
+    pointer with no way to capture the reset/enterPlayMode lambdas directly.
   - Loading replaces the `parts` vector **in place** (`*g_partsForSave =
     std::move(loaded)`), not by swapping the pointer — everything else that references
     `parts` (collision rebuild, rendering) sees the update automatically next frame.

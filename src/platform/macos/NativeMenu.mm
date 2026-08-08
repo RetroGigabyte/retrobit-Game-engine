@@ -2,8 +2,14 @@
 #include "NativeMenu.h"
 
 typedef void (*PathCallback)(const char* path);
+typedef void (*VoidCallback)();
+static VoidCallback g_newCallback = nullptr;
 static PathCallback g_saveCallback = nullptr;
 static PathCallback g_openCallback = nullptr;
+
+void TriggerNew() {
+    if (g_newCallback) g_newCallback();
+}
 
 void TriggerSaveDialog() {
     if (!g_saveCallback) return;
@@ -42,11 +48,15 @@ bool TriggerOpenDialog() {
 }
 
 @interface RetrobitMenuHandler : NSObject
+- (void)newAction:(id)sender;
 - (void)saveAction:(id)sender;
 - (void)openAction:(id)sender;
 @end
 
 @implementation RetrobitMenuHandler
+- (void)newAction:(id)sender {
+    TriggerNew();
+}
 - (void)saveAction:(id)sender {
     TriggerSaveDialog();
 }
@@ -58,7 +68,8 @@ bool TriggerOpenDialog() {
 // Kept alive for the process lifetime; NSMenuItem only holds a weak/unretained target.
 static RetrobitMenuHandler* g_menuHandler = nil;
 
-void SetupNativeFileMenu(void (*onSaveWithPath)(const char* path), void (*onOpenWithPath)(const char* path)) {
+void SetupNativeFileMenu(void (*onNew)(), void (*onSaveWithPath)(const char* path), void (*onOpenWithPath)(const char* path)) {
+    g_newCallback = onNew;
     g_saveCallback = onSaveWithPath;
     g_openCallback = onOpenWithPath;
     g_menuHandler = [[RetrobitMenuHandler alloc] init];
@@ -72,6 +83,13 @@ void SetupNativeFileMenu(void (*onSaveWithPath)(const char* path), void (*onOpen
     NSMenuItem* fileMenuItem = [[NSMenuItem alloc] initWithTitle:@"File" action:nil keyEquivalent:@""];
     NSMenu* fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
     [fileMenuItem setSubmenu:fileMenu];
+
+    NSMenuItem* newItem = [[NSMenuItem alloc] initWithTitle:@"New"
+                                                      action:@selector(newAction:)
+                                               keyEquivalent:@"n"];
+    [newItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
+    [newItem setTarget:g_menuHandler];
+    [fileMenu addItem:newItem];
 
     NSMenuItem* openItem = [[NSMenuItem alloc] initWithTitle:@"Open…"
                                                        action:@selector(openAction:)

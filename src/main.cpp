@@ -123,6 +123,7 @@ static Mesh makeQuad() {
 // Each row is a 5-bit value, MSB = leftmost column.
 static const std::map<char, std::array<uint8_t, 7>> FONT_5X7 = {
     { 'A', {{ 0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001 }} },
+    { 'B', {{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110 }} },
     { 'D', {{ 0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110 }} },
     { 'E', {{ 0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111 }} },
     { 'G', {{ 0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111 }} },
@@ -136,6 +137,7 @@ static const std::map<char, std::array<uint8_t, 7>> FONT_5X7 = {
     { 'S', {{ 0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110 }} },
     { 'U', {{ 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110 }} },
     { 'W', {{ 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001 }} },
+    { 'X', {{ 0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001 }} },
     { 'Y', {{ 0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100 }} },
 };
 
@@ -428,6 +430,14 @@ static std::function<void()> g_enterPlayModeFn;
 // the title screen's Hills preset was active beforehand.
 static WorldPreset* g_worldPresetForLoad = nullptr;
 
+// File > New / Cmd+N: unlike Open, this always succeeds locally (no dialog, no
+// possible cancel), so it can just unconditionally reset to the Playground preset
+// and (re)enter play — from the title screen or mid-game alike.
+static std::function<void()> g_newSceneFn;
+static void triggerNewScene() {
+    if (g_newSceneFn) g_newSceneFn();
+}
+
 // Plain-text .retrobitl format: a header, a part count, then one line per part
 // (position, size, color, rotation as a quaternion). Deliberately simple/human-
 // readable over compact, since there's no tooling to inspect a binary format yet.
@@ -565,6 +575,7 @@ static double g_lastX = 0, g_lastY = 0;
 static bool g_mouseCaptured = true;
 static bool g_editMode = false;
 static GizmoMode g_gizmoMode = GizmoMode::MOVE;
+static bool g_spawnMenuOpen = false; // edit-mode only, toggled with M
 
 void mouseCallback(GLFWwindow* window, double xpos, double ypos) {
     // Camera look tracks mouse movement in both play and edit mode — even with the
@@ -580,28 +591,36 @@ void mouseCallback(GLFWwindow* window, double xpos, double ypos) {
     g_pitch = glm::clamp(g_pitch, -60.0f, 70.0f);
 }
 
+// GLFW's virtual cursor position can drift while GLFW_CURSOR_DISABLED and doesn't
+// reliably re-sync when switching back to NORMAL — re-center it so the very first
+// click after unlocking casts a ray from a sane position. Shared by Esc and M.
+static void unlockMouseForClicking(GLFWwindow* window) {
+    g_mouseCaptured = false;
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    g_firstMouse = true;
+    int w, h;
+    glfwGetWindowSize(window, &w, &h);
+    glfwSetCursorPos(window, w * 0.5, h * 0.5);
+    g_lastX = w * 0.5;
+    g_lastY = h * 0.5;
+}
+
 void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
         // In edit mode, Esc just toggles the mouse lock (locked = look/fly around,
         // unlocked = click to pick/drag parts) without leaving the move tool.
         // Outside edit mode it's the plain mouse-capture toggle it always was.
-        g_mouseCaptured = !g_mouseCaptured;
-        glfwSetInputMode(window, GLFW_CURSOR, g_mouseCaptured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
-        g_firstMouse = true;
-
-        if (!g_mouseCaptured) {
-            // GLFW's virtual cursor position can drift while GLFW_CURSOR_DISABLED and
-            // doesn't reliably re-sync when switching back to NORMAL — re-center it so
-            // the very first click after unlocking casts a ray from a sane position.
-            int w, h;
-            glfwGetWindowSize(window, &w, &h);
-            glfwSetCursorPos(window, w * 0.5, h * 0.5);
-            g_lastX = w * 0.5;
-            g_lastY = h * 0.5;
+        if (g_mouseCaptured) {
+            unlockMouseForClicking(window);
+        } else {
+            g_mouseCaptured = true;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            g_firstMouse = true;
         }
     }
     if (key == GLFW_KEY_SLASH && action == GLFW_PRESS) {
         g_editMode = !g_editMode;
+        g_spawnMenuOpen = false;
         g_mouseCaptured = true; // edit mode starts locked (freecam look/fly); Esc unlocks to pick
         glfwSetInputMode(window, GLFW_CURSOR, g_mouseCaptured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
         g_firstMouse = true;
@@ -612,11 +631,18 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
     if (key == GLFW_KEY_T && action == GLFW_PRESS && g_editMode) {
         g_gizmoMode = (g_gizmoMode == GizmoMode::SCALE) ? GizmoMode::MOVE : GizmoMode::SCALE;
     }
+    if (key == GLFW_KEY_M && action == GLFW_PRESS && g_editMode) {
+        g_spawnMenuOpen = !g_spawnMenuOpen;
+        if (g_spawnMenuOpen && g_mouseCaptured) unlockMouseForClicking(window); // so it can be clicked immediately
+    }
 #ifdef __APPLE__
     bool fileModifierDown = (mods & GLFW_MOD_SUPER) != 0;   // Cmd on macOS
 #else
     bool fileModifierDown = (mods & GLFW_MOD_CONTROL) != 0; // Ctrl elsewhere
 #endif
+    if (key == GLFW_KEY_N && action == GLFW_PRESS && fileModifierDown) {
+        TriggerNew(); // no-op on platforms without a menu bar yet (see src/platform/)
+    }
     if (key == GLFW_KEY_S && action == GLFW_PRESS && fileModifierDown) {
         TriggerSaveDialog(); // no-op on platforms without a native dialog yet (see src/platform/)
     }
@@ -677,10 +703,15 @@ int main() {
 
     // Movable parts (Roblox-Studio-style): "/" toggles the move tool that lets
     // you pick one of these and drag ("R" rotates, "T" resizes) via the gizmo.
-    // The render mesh is a shared unit cube — actual dimensions always come from
-    // Part::size via renderModelMatrix(), so resizing changes what you see, not
-    // just the (separately tracked) collision box.
+    // The render mesh is a shared unit cube (or sphere) — actual dimensions always
+    // come from Part::size via renderModelMatrix(), so resizing changes what you
+    // see, not just the (separately tracked) collision box. Note collision is
+    // always an oriented BOX regardless of visual mesh (buildBoxTriangles/
+    // rayHitsPart both work purely off Part::size) — a spawned sphere looks round
+    // but collides like a box. Fine for a first pass; a true sphere collider would
+    // need its own resolver.
     Mesh partUnitBox = makeBox(1.0f, 1.0f, 1.0f);
+    Mesh partUnitSphere = makeUVSphere(0.5f, 12, 16); // radius 0.5 so default size=(1,1,1) matches the box's footprint
     std::vector<Part> parts;
     parts.push_back(Part{ &partUnitBox, glm::vec3(14.0f, 0.7f, 0.0f), glm::vec3(6.0f, 1.0f, 10.0f), glm::vec3(0.9f, 0.5f, 0.15f),
         glm::angleAxis(glm::radians(12.0f), glm::vec3(1, 0, 0)) });
@@ -716,7 +747,7 @@ int main() {
     int dragAxis = -1;          // 0=X, 1=Y, 2=Z, -1 = not dragging (shared by all three tools)
     g_selectedPartForLoad = &selectedPart;
     g_dragAxisForLoad = &dragAxis;
-    SetupNativeFileMenu(&saveLevelToFile, &loadLevelFromFile); // no-op on platforms without a menu bar yet (see src/platform/)
+    SetupNativeFileMenu(&triggerNewScene, &saveLevelToFile, &loadLevelFromFile); // no-op on platforms without a menu bar yet (see src/platform/)
     glm::vec3 dragStartPos(0.0f);
     float dragTcInitial = 0.0f;
     float rotDragStartAngle = 0.0f;
@@ -726,6 +757,13 @@ int main() {
     float scaleDragTcInitial = 0.0f;
     bool leftMouseWasDown = false;
     GizmoMode lastGizmoMode = g_gizmoMode;
+    bool spawnKey1WasDown = false, spawnKey2WasDown = false; // shape shortcuts in the spawn menu
+
+    // Spawn-menu button rects (M to open) — two shapes stacked near the top of the
+    // screen so they don't overlap the move/rotate/scale gizmo below the cursor.
+    const float SPAWN_BTN_X0 = WIDTH * 0.5f - 110.0f, SPAWN_BTN_X1 = WIDTH * 0.5f + 110.0f;
+    const float SPAWN_BOX_BTN_Y0 = 80.0f, SPAWN_BOX_BTN_Y1 = 130.0f;
+    const float SPAWN_SPHERE_BTN_Y0 = 145.0f, SPAWN_SPHERE_BTN_Y1 = 195.0f;
 
     // Player: a sphere standing in for Sonic's silhouette
     Mesh player = makeUVSphere(1.0f, 16, 24);
@@ -759,6 +797,54 @@ int main() {
     // (ortho overlay) labeled with the FONT_5X7 bitmap font, plus keyboard
     // shortcuts (P / H / O) as the accessible/discoverable fallback. ---
     Mesh uiQuad = makeQuad();
+
+    // Shared 2D-overlay primitives (ortho-projected quads) — used by the title
+    // screen above and the edit-mode spawn menu below, so they're defined once
+    // here rather than duplicated per screen. Both assume the caller has already
+    // set up an ortho uView/uProj and disabled depth test + face culling (see
+    // either call site for the exact setup).
+    auto drawButton = [&](float x0, float y0, float x1, float y1, glm::vec3 color, bool hovered) {
+        glm::vec3 c = hovered ? glm::min(color * 1.3f + glm::vec3(0.1f), glm::vec3(1.0f)) : color;
+        glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3((x0 + x1) * 0.5f, (y0 + y1) * 0.5f, 0.0f));
+        model = glm::scale(model, glm::vec3(x1 - x0, y1 - y0, 1.0f));
+        shader.setMat4("uModel", model);
+        shader.setVec3("uColor", c);
+        uiQuad.draw();
+    };
+
+    // Text is drawn as a grid of small quads from FONT_5X7, built on drawButton
+    // above — crude, but it's zero extra dependencies and there's no
+    // texture/font-loading infrastructure yet.
+    auto drawText = [&](const std::string& text, float centerX, float centerY, float pixelSize, glm::vec3 color) {
+        int totalCols = 0;
+        for (size_t i = 0; i < text.size(); i++) {
+            totalCols += 5;
+            if (i + 1 < text.size()) totalCols += 1; // 1-column gap between glyphs
+        }
+        float totalW = totalCols * pixelSize;
+        float totalH = 7.0f * pixelSize;
+        float startX = centerX - totalW * 0.5f;
+        float startY = centerY - totalH * 0.5f;
+
+        float cursorX = startX;
+        for (char ch : text) {
+            auto it = FONT_5X7.find(ch);
+            if (it != FONT_5X7.end()) {
+                const auto& rows = it->second;
+                for (int row = 0; row < 7; row++) {
+                    for (int col = 0; col < 5; col++) {
+                        if (rows[row] & (1 << (4 - col))) {
+                            float px0 = cursorX + col * pixelSize;
+                            float py0 = startY + row * pixelSize;
+                            drawButton(px0, py0, px0 + pixelSize, py0 + pixelSize, color, false);
+                        }
+                    }
+                }
+            }
+            cursorX += 6.0f * pixelSize; // 5 wide + 1 space
+        }
+    };
+
     AppState appState = AppState::TITLE;
     WorldPreset currentPreset = WorldPreset::PLAYGROUND;
     bool titleLeftMouseWasDown = false;
@@ -805,6 +891,7 @@ int main() {
     g_appStateForLoad = &appState;
     g_enterPlayModeFn = enterPlayMode;
     g_worldPresetForLoad = &currentPreset;
+    g_newSceneFn = [&]() { resetToPlaygroundScene(); enterPlayMode(); };
 
     while (!glfwWindowShouldClose(window)) {
         double now = glfwGetTime();
@@ -883,49 +970,9 @@ int main() {
             shader.setVec3("uFogColor", glm::vec3(0.08f, 0.08f, 0.12f));
             shader.setFloat("uFogDensity", 0.0f); // no fog on a UI overlay
 
-            auto drawButton = [&](float x0, float y0, float x1, float y1, glm::vec3 color, bool hovered) {
-                glm::vec3 c = hovered ? glm::min(color * 1.3f + glm::vec3(0.1f), glm::vec3(1.0f)) : color;
-                glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3((x0 + x1) * 0.5f, (y0 + y1) * 0.5f, 0.0f));
-                model = glm::scale(model, glm::vec3(x1 - x0, y1 - y0, 1.0f));
-                shader.setMat4("uModel", model);
-                shader.setVec3("uColor", c);
-                uiQuad.draw();
-            };
             drawButton(BTN_X0, PLAYGROUND_BTN_Y0, BTN_X1, PLAYGROUND_BTN_Y1, glm::vec3(0.25f, 0.75f, 0.35f), overPlayground);
             drawButton(BTN_X0, HILLS_BTN_Y0, BTN_X1, HILLS_BTN_Y1, glm::vec3(0.55f, 0.45f, 0.15f), overHills);
             drawButton(BTN_X0, OPEN_BTN_Y0, BTN_X1, OPEN_BTN_Y1, glm::vec3(0.05f, 0.35f, 0.95f), overOpen);
-
-            // Text is drawn as a grid of small quads from FONT_5X7, built on the same
-            // drawButton primitive above — see its comment for why this exists at all.
-            auto drawText = [&](const std::string& text, float centerX, float centerY, float pixelSize, glm::vec3 color) {
-                int totalCols = 0;
-                for (size_t i = 0; i < text.size(); i++) {
-                    totalCols += 5;
-                    if (i + 1 < text.size()) totalCols += 1; // 1-column gap between glyphs
-                }
-                float totalW = totalCols * pixelSize;
-                float totalH = 7.0f * pixelSize;
-                float startX = centerX - totalW * 0.5f;
-                float startY = centerY - totalH * 0.5f;
-
-                float cursorX = startX;
-                for (char ch : text) {
-                    auto it = FONT_5X7.find(ch);
-                    if (it != FONT_5X7.end()) {
-                        const auto& rows = it->second;
-                        for (int row = 0; row < 7; row++) {
-                            for (int col = 0; col < 5; col++) {
-                                if (rows[row] & (1 << (4 - col))) {
-                                    float px0 = cursorX + col * pixelSize;
-                                    float py0 = startY + row * pixelSize;
-                                    drawButton(px0, py0, px0 + pixelSize, py0 + pixelSize, color, false);
-                                }
-                            }
-                        }
-                    }
-                    cursorX += 6.0f * pixelSize; // 5 wide + 1 space
-                }
-            };
 
             // pixelSize 4 (not 5, like the old single-button title screen) so
             // "PLAYGROUND" (10 letters) comfortably fits the 320px-wide button.
@@ -1091,7 +1138,40 @@ int main() {
             dragAxis = -1; // switching move<->rotate mid-drag would otherwise reinterpret the axis
             lastGizmoMode = g_gizmoMode;
         }
-        if (g_editMode && !g_mouseCaptured) {
+        if (g_editMode && !g_mouseCaptured && g_spawnMenuOpen) {
+            // Spawn menu takes over clicks/shortcuts entirely while open — no
+            // gizmo interaction happens underneath it.
+            leftMouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+            bool clicked = leftMouseDown && !leftMouseWasDown;
+
+            double mx, my;
+            glfwGetCursorPos(window, &mx, &my);
+            bool overBox = mx >= SPAWN_BTN_X0 && mx <= SPAWN_BTN_X1 && my >= SPAWN_BOX_BTN_Y0 && my <= SPAWN_BOX_BTN_Y1;
+            bool overSphere = mx >= SPAWN_BTN_X0 && mx <= SPAWN_BTN_X1 && my >= SPAWN_SPHERE_BTN_Y0 && my <= SPAWN_SPHERE_BTN_Y1;
+
+            bool key1Down = glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS;
+            bool key2Down = glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS;
+            bool key1Pressed = key1Down && !spawnKey1WasDown;
+            bool key2Pressed = key2Down && !spawnKey2WasDown;
+            spawnKey1WasDown = key1Down;
+            spawnKey2WasDown = key2Down;
+
+            Mesh* spawnMesh = nullptr;
+            if ((clicked && overBox) || key1Pressed) spawnMesh = &partUnitBox;
+            else if ((clicked && overSphere) || key2Pressed) spawnMesh = &partUnitSphere;
+
+            if (spawnMesh) {
+                // Spawn a few units in front of wherever the freecam is looking,
+                // floored so it doesn't land underground/inside the terrain.
+                glm::vec3 spawnPos = eyePos + camFront * 8.0f;
+                spawnPos.y = glm::max(spawnPos.y, 1.0f);
+                parts.push_back(Part{ spawnMesh, spawnPos, glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.75f, 0.3f, 0.9f) });
+                selectedPart = (int)parts.size() - 1;
+                dragAxis = -1;
+                g_gizmoMode = GizmoMode::MOVE; // land in Move so the new part can be repositioned immediately
+                g_spawnMenuOpen = false;
+            }
+        } else if (g_editMode && !g_mouseCaptured) {
             leftMouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
 
             double mx, my;
@@ -1271,10 +1351,16 @@ int main() {
             const char* modeName = g_gizmoMode == GizmoMode::MOVE ? "MOVE(R=rotate,T=scale)"
                                   : g_gizmoMode == GizmoMode::ROTATE ? "ROTATE(R=move,T=scale)"
                                                                       : "SCALE(R=rotate,T=move)";
-            snprintf(titleBuf, sizeof(titleBuf),
-                "RETRObit Engine - EDIT MODE [%s] %s | selected=%d drag=%s LMB=%s | %.0f FPS",
-                g_mouseCaptured ? "LOCKED - fly/look" : "UNLOCKED - click to pick",
-                modeName, selectedPart, axisName, leftMouseDown ? "down" : "up", fpsDisplay);
+            if (g_spawnMenuOpen) {
+                snprintf(titleBuf, sizeof(titleBuf),
+                    "RETRObit Engine - EDIT MODE [SPAWN MENU] click BOX or SPHERE, or press M to cancel | %.0f FPS",
+                    fpsDisplay);
+            } else {
+                snprintf(titleBuf, sizeof(titleBuf),
+                    "RETRObit Engine - EDIT MODE [%s] %s | selected=%d drag=%s LMB=%s M=spawn | %.0f FPS",
+                    g_mouseCaptured ? "LOCKED - fly/look" : "UNLOCKED - click to pick",
+                    modeName, selectedPart, axisName, leftMouseDown ? "down" : "up", fpsDisplay);
+            }
         } else {
             snprintf(titleBuf, sizeof(titleBuf), "RETRObit Engine - Playground | %.0f FPS", fpsDisplay);
         }
@@ -1377,6 +1463,39 @@ int main() {
             shader.setMat4("uModel", model);
             shader.setVec3("uColor", glm::vec3(0.05f, 0.35f, 0.95f)); // Sonic blue
             player.draw();
+        }
+
+        // spawn menu ("M" in edit mode): same ortho-overlay technique as the title
+        // screen (see its comment for why GL_CULL_FACE has to be disabled here too)
+        if (g_editMode && g_spawnMenuOpen) {
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+
+            glm::mat4 spawnUiProj = glm::ortho(0.0f, (float)WIDTH, (float)HEIGHT, 0.0f);
+            glm::mat4 spawnUiView(1.0f);
+            shader.use();
+            shader.setMat4("uView", spawnUiView);
+            shader.setMat4("uProj", spawnUiProj);
+            shader.setVec3("uViewPos", glm::vec3(WIDTH * 0.5f, HEIGHT * 0.5f, 100.0f));
+            shader.setVec3("uSunDir", glm::vec3(0.0f, 0.0f, -1.0f));
+            shader.setVec3("uFogColor", glm::vec3(0.08f, 0.08f, 0.12f));
+            shader.setFloat("uFogDensity", 0.0f);
+
+            double smx, smy;
+            glfwGetCursorPos(window, &smx, &smy);
+            bool overBoxNow = smx >= SPAWN_BTN_X0 && smx <= SPAWN_BTN_X1 && smy >= SPAWN_BOX_BTN_Y0 && smy <= SPAWN_BOX_BTN_Y1;
+            bool overSphereNow = smx >= SPAWN_BTN_X0 && smx <= SPAWN_BTN_X1 && smy >= SPAWN_SPHERE_BTN_Y0 && smy <= SPAWN_SPHERE_BTN_Y1;
+
+            drawButton(SPAWN_BTN_X0, SPAWN_BOX_BTN_Y0, SPAWN_BTN_X1, SPAWN_BOX_BTN_Y1, glm::vec3(0.75f, 0.3f, 0.9f), overBoxNow);
+            drawButton(SPAWN_BTN_X0, SPAWN_SPHERE_BTN_Y0, SPAWN_BTN_X1, SPAWN_SPHERE_BTN_Y1, glm::vec3(0.75f, 0.3f, 0.9f), overSphereNow);
+
+            glm::vec3 spawnTextColor(0.05f, 0.05f, 0.08f);
+            float spawnBtnCenterX = (SPAWN_BTN_X0 + SPAWN_BTN_X1) * 0.5f;
+            drawText("BOX", spawnBtnCenterX, (SPAWN_BOX_BTN_Y0 + SPAWN_BOX_BTN_Y1) * 0.5f, 4.0f, spawnTextColor);
+            drawText("SPHERE", spawnBtnCenterX, (SPAWN_SPHERE_BTN_Y0 + SPAWN_SPHERE_BTN_Y1) * 0.5f, 3.0f, spawnTextColor);
+
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_CULL_FACE);
         }
 
         glfwSwapBuffers(window);
