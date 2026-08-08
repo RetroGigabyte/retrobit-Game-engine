@@ -1,4 +1,4 @@
-#include <OpenGL/gl3.h>
+#include "PlatformGL.h"
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
@@ -115,17 +115,28 @@ static Mesh makeQuad() {
     return m;
 }
 
-// Minimal 5x7 dot-matrix font, just the glyphs the title screen needs ("NEW" /
-// "OPEN"). No texture/font-loading infrastructure exists yet, so each glyph is
-// drawn as a handful of small quads (same technique as the button rectangles) —
-// crude, but it's zero extra dependencies and reads fine at title-screen sizes.
+// Minimal 5x7 dot-matrix font, just the glyphs the title screen needs
+// ("PLAYGROUND", "HILLS", "OPEN"). No texture/font-loading infrastructure
+// exists yet, so each glyph is drawn as a handful of small quads (same
+// technique as the button rectangles) — crude, but it's zero extra
+// dependencies and reads fine at title-screen sizes.
 // Each row is a 5-bit value, MSB = leftmost column.
 static const std::map<char, std::array<uint8_t, 7>> FONT_5X7 = {
-    { 'N', {{ 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001 }} },
+    { 'A', {{ 0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001 }} },
+    { 'D', {{ 0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110 }} },
     { 'E', {{ 0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111 }} },
-    { 'W', {{ 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001 }} },
+    { 'G', {{ 0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111 }} },
+    { 'H', {{ 0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001 }} },
+    { 'I', {{ 0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110 }} },
+    { 'L', {{ 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111 }} },
+    { 'N', {{ 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001 }} },
     { 'O', {{ 0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110 }} },
     { 'P', {{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000 }} },
+    { 'R', {{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001 }} },
+    { 'S', {{ 0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110 }} },
+    { 'U', {{ 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110 }} },
+    { 'W', {{ 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001 }} },
+    { 'Y', {{ 0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100 }} },
 };
 
 // A thin circle drawn as a line loop — used for the rotate-tool's ring handles.
@@ -205,6 +216,59 @@ static std::vector<Tri> buildBoxTriangles(const glm::vec3& size, const glm::mat4
         tris.push_back({ w[f[0]], w[f[2]], w[f[3]] });
     }
     return tris;
+}
+
+// Procedural rolling-hills terrain: a flat grid displaced by a simple sine
+// height field. Builds both the render mesh (with per-vertex normals from a
+// finite-difference gradient) and the matching collision triangles in world
+// space, so hills use exactly the same collide-and-slide resolver as props —
+// no special-casing needed there. Winding is CCW as seen from above (+Y
+// normal) to match the engine's default front-face/culling convention.
+static Mesh makeHillTerrain(float halfSize, int segments, float amplitude, float frequency, std::vector<Tri>& outTriangles) {
+    auto heightAt = [&](float x, float z) {
+        return amplitude * sinf(x * frequency) * cosf(z * frequency);
+    };
+
+    int N = segments + 1;
+    std::vector<glm::vec3> positions(N * N);
+    for (int zi = 0; zi <= segments; zi++) {
+        for (int xi = 0; xi <= segments; xi++) {
+            float x = -halfSize + (2.0f * halfSize) * xi / segments;
+            float z = -halfSize + (2.0f * halfSize) * zi / segments;
+            positions[zi * N + xi] = glm::vec3(x, heightAt(x, z), z);
+        }
+    }
+
+    std::vector<float> verts;
+    verts.reserve(N * N * 6);
+    const float EPS = 0.1f;
+    for (int zi = 0; zi <= segments; zi++) {
+        for (int xi = 0; xi <= segments; xi++) {
+            const glm::vec3& p = positions[zi * N + xi];
+            float hL = heightAt(p.x - EPS, p.z), hR = heightAt(p.x + EPS, p.z);
+            float hD = heightAt(p.x, p.z - EPS), hU = heightAt(p.x, p.z + EPS);
+            glm::vec3 n = glm::normalize(glm::vec3(hL - hR, 2.0f * EPS, hD - hU));
+            verts.insert(verts.end(), { p.x, p.y, p.z, n.x, n.y, n.z });
+        }
+    }
+
+    std::vector<unsigned int> idx;
+    outTriangles.clear();
+    for (int zi = 0; zi < segments; zi++) {
+        for (int xi = 0; xi < segments; xi++) {
+            unsigned int a = zi * N + xi;         // (xi,   zi)
+            unsigned int b = (zi + 1) * N + xi;   // (xi,   zi+1)
+            unsigned int c = (zi + 1) * N + xi + 1;// (xi+1, zi+1)
+            unsigned int d = zi * N + xi + 1;     // (xi+1, zi)
+            idx.insert(idx.end(), { a, b, c, a, c, d });
+            outTriangles.push_back({ positions[a], positions[b], positions[c] });
+            outTriangles.push_back({ positions[a], positions[c], positions[d] });
+        }
+    }
+
+    Mesh m;
+    m.upload(verts, idx);
+    return m;
 }
 
 // Closest point on triangle ABC to point p (Ericson, Real-Time Collision Detection).
@@ -315,6 +379,7 @@ static float cameraUnobstructedDistance(const glm::vec3& lookTarget, const glm::
 }
 
 enum class AppState { TITLE, PLAYING };
+enum class WorldPreset { PLAYGROUND, HILLS };
 
 // ---------------------------------------------------------------------------
 // Editable level "parts" (Roblox-Studio-style) — movable/rotatable boxes with
@@ -358,6 +423,10 @@ static int* g_dragAxisForLoad = nullptr;
 // title screen's own Open button, since both end up calling this function.
 static const AppState* g_appStateForLoad = nullptr;
 static std::function<void()> g_enterPlayModeFn;
+// Saved levels don't carry a ground preset yet (only `parts`), so loading one
+// always lands on the flat playground ground it was designed against, even if
+// the title screen's Hills preset was active beforehand.
+static WorldPreset* g_worldPresetForLoad = nullptr;
 
 // Plain-text .retrobitl format: a header, a part count, then one line per part
 // (position, size, color, rotation as a quaternion). Deliberately simple/human-
@@ -422,6 +491,7 @@ static void loadLevelFromFile(const char* path) {
     *g_partsForSave = std::move(loaded);
     if (g_selectedPartForLoad) *g_selectedPartForLoad = -1;
     if (g_dragAxisForLoad) *g_dragAxisForLoad = -1;
+    if (g_worldPresetForLoad) *g_worldPresetForLoad = WorldPreset::PLAYGROUND;
     std::cout << "Loaded level from " << path << " (" << g_partsForSave->size() << " parts)\n";
 
     if (g_appStateForLoad && *g_appStateForLoad == AppState::TITLE && g_enterPlayModeFn) {
@@ -548,14 +618,10 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
     bool fileModifierDown = (mods & GLFW_MOD_CONTROL) != 0; // Ctrl elsewhere
 #endif
     if (key == GLFW_KEY_S && action == GLFW_PRESS && fileModifierDown) {
-#ifdef __APPLE__
-        TriggerSaveDialog();
-#endif
+        TriggerSaveDialog(); // no-op on platforms without a native dialog yet (see src/platform/)
     }
     if (key == GLFW_KEY_O && action == GLFW_PRESS && fileModifierDown) {
-#ifdef __APPLE__
-        TriggerOpenDialog();
-#endif
+        TriggerOpenDialog(); // no-op on platforms without a native dialog yet (see src/platform/)
     }
 }
 
@@ -599,6 +665,16 @@ int main() {
     const float TILE = 4.0f;
     Mesh tile = makeBox(TILE, 0.5f, TILE);
 
+    // Alternate world preset: rolling hills terrain, built once at startup
+    // (see makeHillTerrain) rather than regenerated per preset switch. Its
+    // triangles feed the same collide-and-slide resolver used for props.
+    const float HILL_HALF_SIZE = 60.0f;
+    const int HILL_SEGMENTS = 48;
+    const float HILL_AMPLITUDE = 3.0f;
+    const float HILL_FREQUENCY = 0.12f;
+    std::vector<Tri> hillTriangles;
+    Mesh hillMesh = makeHillTerrain(HILL_HALF_SIZE, HILL_SEGMENTS, HILL_AMPLITUDE, HILL_FREQUENCY, hillTriangles);
+
     // Movable parts (Roblox-Studio-style): "/" toggles the move tool that lets
     // you pick one of these and drag ("R" rotates, "T" resizes) via the gizmo.
     // The render mesh is a shared unit cube — actual dimensions always come from
@@ -640,9 +716,7 @@ int main() {
     int dragAxis = -1;          // 0=X, 1=Y, 2=Z, -1 = not dragging (shared by all three tools)
     g_selectedPartForLoad = &selectedPart;
     g_dragAxisForLoad = &dragAxis;
-#ifdef __APPLE__
-    SetupNativeFileMenu(&saveLevelToFile, &loadLevelFromFile);
-#endif
+    SetupNativeFileMenu(&saveLevelToFile, &loadLevelFromFile); // no-op on platforms without a menu bar yet (see src/platform/)
     glm::vec3 dragStartPos(0.0f);
     float dragTcInitial = 0.0f;
     float rotDragStartAngle = 0.0f;
@@ -680,18 +754,20 @@ int main() {
     double fpsDisplay = 0.0;
     char titleBuf[192];
 
-    // --- Title screen: New / Open, no on-screen text yet so buttons are plain
-    // colored rectangles (ortho overlay) plus keyboard shortcuts (N / O) as the
-    // accessible/discoverable fallback until there's a text renderer. ---
+    // --- Title screen: pick a world preset (Playground / Hills) or Open a saved
+    // level. No on-screen text renderer, so buttons are plain colored rectangles
+    // (ortho overlay) labeled with the FONT_5X7 bitmap font, plus keyboard
+    // shortcuts (P / H / O) as the accessible/discoverable fallback. ---
     Mesh uiQuad = makeQuad();
     AppState appState = AppState::TITLE;
+    WorldPreset currentPreset = WorldPreset::PLAYGROUND;
     bool titleLeftMouseWasDown = false;
-    bool titleNWasDown = false, titleOWasDown = false;
+    bool titlePWasDown = false, titleHWasDown = false, titleOWasDown = false;
 
-    const float NEW_BTN_X0 = WIDTH * 0.5f - 160.0f, NEW_BTN_X1 = WIDTH * 0.5f + 160.0f;
-    const float NEW_BTN_Y0 = HEIGHT * 0.5f - 70.0f, NEW_BTN_Y1 = HEIGHT * 0.5f - 10.0f;
-    const float OPEN_BTN_X0 = WIDTH * 0.5f - 160.0f, OPEN_BTN_X1 = WIDTH * 0.5f + 160.0f;
-    const float OPEN_BTN_Y0 = HEIGHT * 0.5f + 10.0f, OPEN_BTN_Y1 = HEIGHT * 0.5f + 70.0f;
+    const float BTN_X0 = WIDTH * 0.5f - 160.0f, BTN_X1 = WIDTH * 0.5f + 160.0f;
+    const float PLAYGROUND_BTN_Y0 = HEIGHT * 0.5f - 90.0f, PLAYGROUND_BTN_Y1 = HEIGHT * 0.5f - 40.0f;
+    const float HILLS_BTN_Y0 = HEIGHT * 0.5f - 25.0f, HILLS_BTN_Y1 = HEIGHT * 0.5f + 25.0f;
+    const float OPEN_BTN_Y0 = HEIGHT * 0.5f + 40.0f, OPEN_BTN_Y1 = HEIGHT * 0.5f + 90.0f;
 
     // Title screen starts with the mouse free so the buttons can be clicked;
     // entering play mode below re-locks it the same way edit mode does.
@@ -699,11 +775,17 @@ int main() {
     g_mouseCaptured = false;
     g_firstMouse = true;
 
-    auto resetToDefaultScene = [&]() {
+    auto resetToPlaygroundScene = [&]() {
+        currentPreset = WorldPreset::PLAYGROUND;
         parts.clear();
         parts.push_back(Part{ &partUnitBox, glm::vec3(14.0f, 0.7f, 0.0f), glm::vec3(6.0f, 1.0f, 10.0f), glm::vec3(0.9f, 0.5f, 0.15f),
             glm::angleAxis(glm::radians(12.0f), glm::vec3(1, 0, 0)) });
         parts.push_back(Part{ &partUnitBox, glm::vec3(-16.0f, 3.0f, -10.0f), glm::vec3(3.0f, 6.0f, 3.0f), glm::vec3(0.85f, 0.2f, 0.35f) });
+    };
+
+    auto resetToHillsScene = [&]() {
+        currentPreset = WorldPreset::HILLS;
+        parts.clear(); // the terrain itself is the content; no boxes needed
     };
 
     auto enterPlayMode = [&]() {
@@ -722,6 +804,7 @@ int main() {
 
     g_appStateForLoad = &appState;
     g_enterPlayModeFn = enterPlayMode;
+    g_worldPresetForLoad = &currentPreset;
 
     while (!glfwWindowShouldClose(window)) {
         double now = glfwGetTime();
@@ -746,31 +829,40 @@ int main() {
             bool clicked = leftDown && !titleLeftMouseWasDown;
             titleLeftMouseWasDown = leftDown;
 
-            bool nDown = glfwGetKey(window, GLFW_KEY_N) == GLFW_PRESS;
+            bool pDown = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
+            bool hDown = glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS;
             bool oDown = glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS;
-            bool nPressed = nDown && !titleNWasDown;
+            bool pPressed = pDown && !titlePWasDown;
+            bool hPressed = hDown && !titleHWasDown;
             bool oPressed = oDown && !titleOWasDown;
-            titleNWasDown = nDown;
+            titlePWasDown = pDown;
+            titleHWasDown = hDown;
             titleOWasDown = oDown;
 
-            bool overNew = mx >= NEW_BTN_X0 && mx <= NEW_BTN_X1 && my >= NEW_BTN_Y0 && my <= NEW_BTN_Y1;
-            bool overOpen = mx >= OPEN_BTN_X0 && mx <= OPEN_BTN_X1 && my >= OPEN_BTN_Y0 && my <= OPEN_BTN_Y1;
+            bool overPlayground = mx >= BTN_X0 && mx <= BTN_X1 && my >= PLAYGROUND_BTN_Y0 && my <= PLAYGROUND_BTN_Y1;
+            bool overHills = mx >= BTN_X0 && mx <= BTN_X1 && my >= HILLS_BTN_Y0 && my <= HILLS_BTN_Y1;
+            bool overOpen = mx >= BTN_X0 && mx <= BTN_X1 && my >= OPEN_BTN_Y0 && my <= OPEN_BTN_Y1;
 
-            if (nPressed || (clicked && overNew)) {
-                resetToDefaultScene();
+            if (pPressed || (clicked && overPlayground)) {
+                resetToPlaygroundScene();
+                enterPlayMode();
+            } else if (hPressed || (clicked && overHills)) {
+                resetToHillsScene();
                 enterPlayMode();
             } else if (oPressed || (clicked && overOpen)) {
-#ifdef __APPLE__
                 // loadLevelFromFile calls enterPlayMode itself on success (since
                 // g_appStateForLoad reads TITLE here) — same code path the native
-                // File > Open menu item uses, so both behave identically.
-                TriggerOpenDialog();
-#else
-                enterPlayMode(); // no dialog on this platform yet; just start with the default scene
-#endif
+                // File > Open menu item uses, so both behave identically. On
+                // platforms without a real dialog yet (see src/platform/), the stub
+                // returns false, so OPEN falls back to starting the playground preset
+                // instead of silently doing nothing.
+                if (!TriggerOpenDialog()) {
+                    resetToPlaygroundScene();
+                    enterPlayMode();
+                }
             }
 
-            snprintf(titleBuf, sizeof(titleBuf), "RETRObit Engine - Title Screen | N / click = New, O / click = Open");
+            snprintf(titleBuf, sizeof(titleBuf), "RETRObit Engine - Title Screen | P = Playground, H = Hills, O = Open");
             glfwSetWindowTitle(window, titleBuf);
 
             glClearColor(0.08f, 0.08f, 0.12f, 1.0f);
@@ -799,8 +891,9 @@ int main() {
                 shader.setVec3("uColor", c);
                 uiQuad.draw();
             };
-            drawButton(NEW_BTN_X0, NEW_BTN_Y0, NEW_BTN_X1, NEW_BTN_Y1, glm::vec3(0.25f, 0.75f, 0.35f), overNew);
-            drawButton(OPEN_BTN_X0, OPEN_BTN_Y0, OPEN_BTN_X1, OPEN_BTN_Y1, glm::vec3(0.05f, 0.35f, 0.95f), overOpen);
+            drawButton(BTN_X0, PLAYGROUND_BTN_Y0, BTN_X1, PLAYGROUND_BTN_Y1, glm::vec3(0.25f, 0.75f, 0.35f), overPlayground);
+            drawButton(BTN_X0, HILLS_BTN_Y0, BTN_X1, HILLS_BTN_Y1, glm::vec3(0.55f, 0.45f, 0.15f), overHills);
+            drawButton(BTN_X0, OPEN_BTN_Y0, BTN_X1, OPEN_BTN_Y1, glm::vec3(0.05f, 0.35f, 0.95f), overOpen);
 
             // Text is drawn as a grid of small quads from FONT_5X7, built on the same
             // drawButton primitive above — see its comment for why this exists at all.
@@ -834,9 +927,13 @@ int main() {
                 }
             };
 
+            // pixelSize 4 (not 5, like the old single-button title screen) so
+            // "PLAYGROUND" (10 letters) comfortably fits the 320px-wide button.
             glm::vec3 textColor(0.05f, 0.08f, 0.05f);
-            drawText("NEW", (NEW_BTN_X0 + NEW_BTN_X1) * 0.5f, (NEW_BTN_Y0 + NEW_BTN_Y1) * 0.5f, 5.0f, textColor);
-            drawText("OPEN", (OPEN_BTN_X0 + OPEN_BTN_X1) * 0.5f, (OPEN_BTN_Y0 + OPEN_BTN_Y1) * 0.5f, 5.0f, textColor);
+            float btnCenterX = (BTN_X0 + BTN_X1) * 0.5f;
+            drawText("PLAYGROUND", btnCenterX, (PLAYGROUND_BTN_Y0 + PLAYGROUND_BTN_Y1) * 0.5f, 4.0f, textColor);
+            drawText("HILLS", btnCenterX, (HILLS_BTN_Y0 + HILLS_BTN_Y1) * 0.5f, 4.0f, textColor);
+            drawText("OPEN", btnCenterX, (OPEN_BTN_Y0 + OPEN_BTN_Y1) * 0.5f, 4.0f, textColor);
 
             glEnable(GL_DEPTH_TEST);
             glEnable(GL_CULL_FACE);
@@ -887,6 +984,12 @@ int main() {
             std::vector<Tri> t = buildBoxTriangles(part.size, part.modelMatrix());
             propTriangles.insert(propTriangles.end(), t.begin(), t.end());
         }
+        // Hills preset: the terrain itself is real (precomputed) triangle geometry,
+        // so it rides the same collide-and-slide resolver as props — no flat ground
+        // plane exists in this preset, see the branch below.
+        if (currentPreset == WorldPreset::HILLS) {
+            propTriangles.insert(propTriangles.end(), hillTriangles.begin(), hillTriangles.end());
+        }
 
         // Player physics is fully paused in edit mode — otherwise residual velocity
         // (mid-air jump, sliding) keeps integrating while you're trying to use the
@@ -906,15 +1009,20 @@ int main() {
             // collide-and-slide against props (ramp, pillar, and anything added later)
             onGround = resolveSphereVsTriangles(playerPos, playerVel, PLAYER_RADIUS, propTriangles);
 
-            // analytic ground plane at y = 0 — bounded to the actual tile area (not
-            // infinite) so walking off the edge of the checkerboard really does drop
-            // you into the void instead of hitting an invisible floor everywhere.
-            const float GROUND_HALF_EXTENT = (GRID + 0.5f) * TILE;
-            bool overGround = fabsf(playerPos.x) <= GROUND_HALF_EXTENT && fabsf(playerPos.z) <= GROUND_HALF_EXTENT;
-            if (overGround && playerPos.y - PLAYER_RADIUS < 0.0f) {
-                playerPos.y = PLAYER_RADIUS;
-                if (playerVel.y < 0.0f) playerVel.y = 0.0f;
-                onGround = true;
+            // analytic ground plane at y = 0 — only in the Playground preset. Bounded
+            // to the actual tile area (not infinite) so walking off the edge of the
+            // checkerboard really does drop you into the void instead of hitting an
+            // invisible floor everywhere. Hills has no flat plane at all — its terrain
+            // triangles (merged into propTriangles above) are what the resolve call
+            // just above already collided against.
+            if (currentPreset == WorldPreset::PLAYGROUND) {
+                const float GROUND_HALF_EXTENT = (GRID + 0.5f) * TILE;
+                bool overGround = fabsf(playerPos.x) <= GROUND_HALF_EXTENT && fabsf(playerPos.z) <= GROUND_HALF_EXTENT;
+                if (overGround && playerPos.y - PLAYER_RADIUS < 0.0f) {
+                    playerPos.y = PLAYER_RADIUS;
+                    if (playerVel.y < 0.0f) playerVel.y = 0.0f;
+                    onGround = true;
+                }
             }
 
             // fallen into the void: gravity just keeps accelerating you down past the
@@ -1185,16 +1293,22 @@ int main() {
         shader.setVec3("uFogColor", fogColor);
         shader.setFloat("uFogDensity", 0.012f);
 
-        // ground checkerboard
-        for (int i = -GRID; i <= GRID; i++) {
-            for (int j = -GRID; j <= GRID; j++) {
-                glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(i * TILE, -0.25f, j * TILE));
-                shader.setMat4("uModel", model);
-                bool even = ((i + j) % 2 + 2) % 2 == 0;
-                glm::vec3 c = even ? glm::vec3(0.25f, 0.75f, 0.35f) : glm::vec3(0.20f, 0.65f, 0.30f);
-                shader.setVec3("uColor", c);
-                tile.draw();
+        // ground: checkerboard tiles (Playground) or the rolling hill mesh (Hills)
+        if (currentPreset == WorldPreset::PLAYGROUND) {
+            for (int i = -GRID; i <= GRID; i++) {
+                for (int j = -GRID; j <= GRID; j++) {
+                    glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(i * TILE, -0.25f, j * TILE));
+                    shader.setMat4("uModel", model);
+                    bool even = ((i + j) % 2 + 2) % 2 == 0;
+                    glm::vec3 c = even ? glm::vec3(0.25f, 0.75f, 0.35f) : glm::vec3(0.20f, 0.65f, 0.30f);
+                    shader.setVec3("uColor", c);
+                    tile.draw();
+                }
             }
+        } else {
+            shader.setMat4("uModel", glm::mat4(1.0f));
+            shader.setVec3("uColor", glm::vec3(0.35f, 0.65f, 0.25f)); // grassy green
+            hillMesh.draw();
         }
 
         // movable parts (ramp, pillar, ...) — brighten the selected one

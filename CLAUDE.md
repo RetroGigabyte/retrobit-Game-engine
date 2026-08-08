@@ -20,9 +20,49 @@ load-bearing engine design.
 - Build: CMake
 - Windowing/input: GLFW (via Homebrew)
 - Math: GLM (via Homebrew)
-- Graphics: OpenGL 4.1 core profile, via macOS's native `<OpenGL/gl3.h>` — **no GLAD/loader
-  needed** on macOS since Apple exposes core-profile entry points directly (this would need
-  a loader like GLAD if ever ported to Windows/Linux).
+- Graphics: OpenGL 4.1 core profile, via `include/PlatformGL.h` → macOS's native
+  `<OpenGL/gl3.h>` — **no GLAD/loader needed** on macOS since Apple exposes core-profile
+  entry points directly. Windows/Linux aren't wired up yet (see Platform support below).
+
+## Platform support
+
+Only macOS actually builds and runs right now, but the codebase is structured so adding
+a second platform is additive rather than a rewrite:
+
+- **`src/platform/<platform>/`** holds one dedicated implementation per target platform
+  of anything that isn't cross-platform by nature (currently just the native menu
+  bar / file dialogs). `include/NativeMenu.h` declares the shared function signatures;
+  `src/platform/macos/NativeMenu.mm` is the real Cocoa implementation, and
+  `src/platform/stub/NativeMenu_stub.cpp` is a harmless no-op fallback. `CMakeLists.txt`
+  picks which one to compile based on `if(APPLE)` — engine code (`main.cpp`) calls these
+  functions unconditionally, with **no `#ifdef __APPLE__` at the call sites**. Where
+  `TriggerOpenDialog()`'s `false` return (stub, or a canceled real dialog) has a
+  sensible fallback, main.cpp uses it instead of special-casing the platform (see the
+  title screen's OPEN handler).
+- **`include/PlatformGL.h`** picks the right OpenGL header the same way, but by
+  `#ifdef` inside one header rather than a whole file — it's a one-line-per-platform
+  choice, not enough logic to justify a dedicated source file per platform.
+- **Adding a real Windows/Linux build** needs two things this doesn't yet provide:
+  an OpenGL loader (e.g. GLAD, vendored into `third_party/` and wired into
+  `PlatformGL.h` + `CMakeLists.txt` in place of the current `#error`), and GLFW/CMake
+  package availability on that platform (not verified — this has only ever been built
+  via Homebrew on macOS). Nobody has attempted either yet.
+- **Other targets, noted for later, not started:**
+  - **Windows** — GLFW + OpenGL both support it natively; realistically the easiest
+    non-Apple target once a loader is vendored in. Native menu bar would need a Win32
+    implementation under `src/platform/windows/` (or just keep using the stub, since
+    Windows apps don't strictly need a classic menu bar).
+  - **Linux** — same GLFW/OpenGL story as Windows; native file dialogs would need
+    something like GTK or a portal (xdg-desktop-portal) under `src/platform/linux/`,
+    or the stub, same tradeoff.
+  - **Android** — a much bigger lift: no GLFW (would need `ANativeActivity`/`ndk_helper`
+    or similar), touch input instead of mouse/keyboard, OpenGL ES rather than desktop
+    GL, and the whole editor tool assumes a mouse cursor + keyboard shortcuts that
+    don't exist on touch. Would need real design work, not just a new platform folder.
+  - **3DS** — homebrew toolchain (devkitARM/citro3d), no OpenGL at all, dual screens,
+    tiny fixed resources — closer to a second renderer + input backend than a "platform
+    file." Interesting for the retro angle but a genuinely separate effort from the
+    OpenGL/GLFW path the engine is built around today.
 
 ## Layout
 
@@ -30,12 +70,17 @@ load-bearing engine design.
 retrobit/
   CMakeLists.txt
   src/
-    main.cpp       # everything currently lives here: window, input, physics, rendering
+    main.cpp             # everything currently lives here: window, input, physics, rendering
     Shader.cpp
-    NativeMenu.mm  # Objective-C++, macOS-only: File menu / save dialog (see below)
+    platform/            # one dedicated implementation per target platform — see below
+      macos/
+        NativeMenu.mm    # Objective-C++: real File menu / save & open dialogs (Cocoa)
+      stub/
+        NativeMenu_stub.cpp  # no-op fallback for every other platform
   include/
     Shader.h
-    NativeMenu.h
+    NativeMenu.h         # platform-agnostic declarations — same signatures, either implementation
+    PlatformGL.h         # picks the right OpenGL header per platform
   shaders/
     basic.vert
     basic.frag
@@ -55,12 +100,12 @@ cmake --build .
 
 ## Controls
 
-**Title screen** (shown at launch): click **NEW** or **OPEN**, or press `N`/`O`.
-NEW resets to the hardcoded ramp+pillar scene; OPEN shows the native open dialog
-(`Cmd+O` or `File > Open` do the same thing and land you in play the same way — see
-Level save/open below). Rendered as an ortho overlay with hand-rolled button
-rectangles and a minimal 5x7 bitmap font (`FONT_5X7`) — no text/image-loading
-infrastructure exists yet.
+**Title screen** (shown at launch): three stacked buttons, click or press the shortcut —
+**PLAYGROUND** (`P`, the hardcoded ramp+pillar scene), **HILLS** (`H`, procedural rolling
+terrain, no boxes), or **OPEN** (`O`, native open dialog — `Cmd+O` / `File > Open` do the
+same thing and land you in play the same way, see Level save/open below). Rendered as an
+ortho overlay with hand-rolled button rectangles and a minimal 5x7 bitmap font
+(`FONT_5X7`) — no text/image-loading infrastructure exists yet.
 
 **Play mode:**
 - `WASD` — move (camera-relative, flattened — no flying)
@@ -94,25 +139,38 @@ editing so the world doesn't drift out from under you.
 ## What's implemented
 
 - **Title screen** (`AppState::TITLE` / `AppState::PLAYING`, gates the top of the main
-  loop with an early `continue`): NEW rebuilds the default scene via
-  `resetToDefaultScene()`; OPEN calls `TriggerOpenDialog()`. Buttons are ortho-projected
-  quads (`makeQuad()`), hit-tested with a plain screen-space AABB check against
-  `glfwGetCursorPos` (no 3D raycast needed, unlike the editor's picking) — note the
-  ortho projection's top-left-origin Y-flip also flips triangle winding, so
-  `GL_CULL_FACE` has to be disabled for this one draw pass or the quads vanish.
-  `loadLevelFromFile` itself decides whether to call `enterPlayMode()` (via
-  `g_appStateForLoad`/`g_enterPlayModeFn`, checked against `AppState::TITLE`) so the
-  native File > Open menu item and the title screen's own OPEN button both transition
-  correctly, and loading a level while already playing doesn't reset the player/camera.
-  Text ("NEW"/"OPEN") is a minimal 5x7 bitmap font (`FONT_5X7`) drawn as small quads —
-  see Controls above.
+  loop with an early `continue`): PLAYGROUND/HILLS pick a `WorldPreset` and rebuild the
+  scene via `resetToPlaygroundScene()`/`resetToHillsScene()`; OPEN calls
+  `TriggerOpenDialog()`. Buttons are ortho-projected quads (`makeQuad()`), hit-tested
+  with a plain screen-space AABB check against `glfwGetCursorPos` (no 3D raycast
+  needed, unlike the editor's picking) — note the ortho projection's top-left-origin
+  Y-flip also flips triangle winding, so `GL_CULL_FACE` has to be disabled for this
+  one draw pass or the quads vanish. `loadLevelFromFile` itself decides whether to
+  call `enterPlayMode()` (via `g_appStateForLoad`/`g_enterPlayModeFn`, checked against
+  `AppState::TITLE`) so the native File > Open menu item and the title screen's own
+  OPEN button both transition correctly, and loading a level while already playing
+  doesn't reset the player/camera or ground preset. Loading always resets to the
+  Playground preset (`g_worldPresetForLoad`) since saved `.retrobitl` files don't carry
+  a ground preset yet — only `parts`. Text is a minimal 5x7 bitmap font (`FONT_5X7`)
+  drawn as small quads — see Controls above.
+- **World presets** (`WorldPreset::PLAYGROUND` / `WorldPreset::HILLS`, `currentPreset`
+  in `main()`): Playground is the original flat checkerboard + ramp/pillar scene.
+  Hills is procedural rolling terrain (`makeHillTerrain`) — a sine-height-fielded grid
+  built once at startup (not regenerated per preset switch), with no boxes. Both the
+  render mesh (with finite-difference normals) and its world-space collision triangles
+  come from the same generator call, so hills collide via the same
+  `resolveSphereVsTriangles` path as props — merged into `propTriangles` only when
+  `currentPreset == HILLS`. The analytic flat ground plane (see below) is Playground-only;
+  Hills has no flat-plane fallback at all, so its terrain triangles are the only thing
+  holding the player up, and walking off the generated grid's edge is a real void-fall,
+  same as walking off the Playground checkerboard.
 - Window/GL context + render loop (`src/main.cpp`), explicit `glViewport` set from
   `glfwGetFramebufferSize` at startup (previously relied on driver defaults)
 - Basic forward-shaded pipeline: `Shader` class, `basic.vert`/`basic.frag` with
   simple diffuse + rim light + exponential-squared fog (the "early 3D playground" look)
-- Flat checkerboard ground (analytic plane collision at y=0, not real geometry, for perf) —
-  **bounded** to the actual tile area (`GROUND_HALF_EXTENT`), not infinite, so walking
-  off the edge really does drop you
+- Flat checkerboard ground (Playground preset only; analytic plane collision at y=0,
+  not real geometry, for perf) — **bounded** to the actual tile area
+  (`GROUND_HALF_EXTENT`), not infinite, so walking off the edge really does drop you
 - Player: a sphere stand-in for Sonic, with run/accel/friction, gravity, jump
 - Void/respawn: gravity keeps accelerating you down past the level with no floor once
   you're off the ground bounds or through a gap; crossing `VOID_Y` (-20) resets you to
@@ -184,10 +242,12 @@ editing so the world doesn't drift out from under you.
   unlit shader pass if it becomes hard to read.
 - No undo and no drag-cancel (e.g. right-click mid-drag to abort) — a bad drag has to
   be manually corrected.
-- Only two parts exist in the level; the tool and collision system both generalize to
-  more, but nothing's been added yet.
-- Nothing auto-loads a level at startup — you always get the hardcoded ramp+pillar
-  scene until you manually `Cmd+O` a saved file.
+- Only two parts exist in the Playground preset; the tool and collision system both
+  generalize to more, but nothing's been added yet.
+- `cameraUnobstructedDistance`'s hardcoded flat-plane-at-y=0 fallback (used for chase-cam
+  collision) doesn't know about Hills terrain — it's harmless (can only ever pull the
+  camera closer in, never let it clip further out) but not strictly correct once hills
+  amplitude/frequency change enough for the plane assumption to matter.
 - `Ctrl+S`/`Ctrl+O` on non-Apple builds are stubbed (the key combos are detected in
   `keyCallback`, but the `#else` branch has no dialog implementation, since the whole
   engine is macOS-only right now — `<OpenGL/gl3.h>`, Cocoa). Not a real gap yet, just

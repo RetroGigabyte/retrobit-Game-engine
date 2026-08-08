@@ -15,11 +15,19 @@ endif()
 find_package(glfw3 REQUIRED)
 find_package(glm REQUIRED)
 
+# Platform-agnostic sources (engine core) — deliberately excludes src/platform/,
+# which holds one dedicated implementation per target platform (see below) so
+# the engine can call things like the native menu bar without #ifdef guards at
+# every call site: CMake picks which platform's file actually gets compiled.
 file(GLOB_RECURSE ENGINE_SOURCES CONFIGURE_DEPENDS src/*.cpp)
+list(FILTER ENGINE_SOURCES EXCLUDE REGEX "/platform/")
+
 if(APPLE)
-    file(GLOB_RECURSE ENGINE_OBJCXX_SOURCES CONFIGURE_DEPENDS src/*.mm)
-    list(APPEND ENGINE_SOURCES ${ENGINE_OBJCXX_SOURCES})
+    file(GLOB_RECURSE ENGINE_PLATFORM_SOURCES CONFIGURE_DEPENDS src/platform/macos/*.mm)
+else()
+    file(GLOB_RECURSE ENGINE_PLATFORM_SOURCES CONFIGURE_DEPENDS src/platform/stub/*.cpp)
 endif()
+list(APPEND ENGINE_SOURCES ${ENGINE_PLATFORM_SOURCES})
 
 add_executable(retrobit ${ENGINE_SOURCES})
 

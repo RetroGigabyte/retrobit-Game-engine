@@ -1,5 +1,5 @@
 #include "Shader.h"
-#include <OpenGL/gl3.h>
+#include "PlatformGL.h"
 #include <fstream>
 #include <sstream>
 #include <iostream>
