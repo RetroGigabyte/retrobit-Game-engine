@@ -1,6 +1,6 @@
 # RETRObit Engine
 
-**AI Disclaimer:** This project was developed with the assistance of Claude AI. I believe AI-written code should be open source to benefit everyone and maintain transparency.
+> **AI Disclaimer:** This project was developed with the assistance of Claude AI. I believe AI-written code should be open source to benefit everyone and maintain transparency.
 
 A custom native C++ 3D game engine, currently proving itself out with a test scene
 that goes for late-Sonic-Xtreme-era vibes — bright saturated colors, simple fog,
