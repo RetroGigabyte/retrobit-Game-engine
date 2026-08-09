@@ -5,8 +5,8 @@ test scene (checkerboard playground, sphere player, run/jump physics) is built t
 exercise and validate late-Sonic-Xtreme-era vibes (bright saturated colors, simple fog,
 curved/ramped playgrounds, fast movement) as a proving ground for the engine's
 rendering, collision, and editor systems — but that's demo content, not the engine
-itself. The engine should stay capable of building other kinds of games. Scratch-style
-block coding is a planned future layer on top, not started yet.
+itself. The engine should stay capable of building other kinds of games. Scratch/
+TurboWarp-style block coding is underway — see "Block coding" below for the v1 state.
 
 **Current state note:** `main.cpp` doesn't yet separate "engine" from "this demo" —
 renderer, collision, and the Part/gizmo editor are general-purpose, but they're
@@ -81,9 +81,12 @@ retrobit/
     Shader.h
     NativeMenu.h         # platform-agnostic declarations — same signatures, either implementation
     PlatformGL.h         # picks the right OpenGL header per platform
+    BlockScript.h        # block-coding data model (types/defs/layout) — no engine coupling
   shaders/
     basic.vert
     basic.frag
+    ui.vert         # 2D UI: rounded-rect + puzzle-notch SDF (title/spawn menu/block editor)
+    ui.frag
   build/            # cmake build dir (gitignored-worthy, not committed)
   level.retrobitl   # wherever you last saved to — not committed, not auto-loaded yet
 ```
@@ -109,8 +112,44 @@ ortho overlay with hand-rolled button rectangles and a minimal 5x7 bitmap font
 
 **Play mode:**
 - `WASD` — move (camera-relative, flattened — no flying)
+- `E` — sprint: a flat 1.6x speed multiplier on top of `RUN_SPEED`, no separate
+  accel/ramp. Normal walk mode only — flight mode already uses `E` for its own boost.
 - Mouse — camera orbit (look)
 - `Space` — jump
+- `F` — toggle **flight mode**: StarFox All-Range Mode-style — the ship moves
+  forward on its own at all times (no key needed), `W`/`S` steer up/down and
+  `A`/`D` strafe left/right (camera-relative), gravity is off — but collision
+  stays on (not noclip), so you still can't fly through props/terrain. Mouse
+  look is disabled while flying (steering is entirely W/S/A/D, matching a
+  stick-only control scheme) and resumes the moment you land. Distinct
+  from edit mode's freecam, which already flies and keeps its own WASD+forward
+  scheme; `F` only does anything in play mode. Title bar shows
+  `[FLIGHT MODE - always forward, W/S up/down, A/D strafe]` while active.
+  Flight mode also has some further StarFox 64 (All-Range Mode)-inspired
+  extras, ported from what the
+  [SF64 decompilation](https://github.com/HarbourMasters/Starship)'s gameplay
+  is known for rather than from that repo's code directly (it's a PC
+  port/build-tooling repo, not a mechanics reference):
+  - `E` — **boost** (temporarily faster flight speed), `C` — **brake**
+    (temporarily slower). Not `Q` (already the global quit key) or `Left Ctrl`
+    (macOS commonly grabs a held Ctrl for Mission Control/Spaces switching,
+    which yanks focus from the app mid-flight and looks like a crash).
+  - Double-tap `A` or `D` — **barrel roll**: a quick cosmetic 360 camera roll,
+    purely visual (doesn't affect movement/collision).
+  - Holding `A`/`D` also **banks the camera** into the turn (rolls toward level
+    again when released) instead of staying perfectly level — this is a camera
+    roll only since RETRObit is first-person with no visible ship model.
+  - **Arena boundary**: flying more than 160 units from spawn pushes you back
+    inward instead of allowing infinite freeflight, echoing All-Range Mode's
+    bounded play area.
+  - `U` — **U-turn**: instantly flips `g_yaw` 180 degrees and reverses current
+    velocity to match, so you're immediately flying back the way you came
+    instead of coasting through a slow turn. `playerPos` itself is never
+    touched — but the chase camera used to ease from "behind the old
+    direction" to "behind the new one" over about a second, arcing wildly
+    across/through the world since the ideal camera offset flipped instantly;
+    that swing read as the player getting reset. Fixed by snapping the camera
+    straight to its new spot on the u-turn's frame instead of easing.
 - `Esc` — toggle mouse capture
 - `/` — enter the edit tool (see below)
 - `Q` — quit
@@ -135,6 +174,18 @@ editing so the world doesn't drift out from under you.
   spawn a new part 8 units in front of wherever the freecam is looking (floored so it
   doesn't land underground), auto-selected and in Move mode so you can reposition it
   right away. Press `M` again to close without spawning.
+- `B` — open the **block-coding editor** (full-screen, not an overlay — the 3D world
+  is hidden while it's open). Drag blocks from the palette (left) onto the workspace
+  (center) to build a script top-to-bottom; drag within the workspace to reorder,
+  drag onto the red zone (bottom) to delete. Blocks with parameters show `-`/`+`
+  steppers next to the value (no free-text entry — there's no text-input widget in
+  the engine yet). Each block also has a pair of `-`/`+` **nesting buttons** at its
+  far right — outdent/indent it to control REPEAT loop nesting (drag-into-the-C-shape
+  isn't implemented; nesting is edited by depth instead — see "Block coding" below).
+  Click **RUN** to execute the script against the live 3D world (switches back to the
+  normal view while it runs); `Esc` or `B` again returns to the editor without
+  running. Press `B` again mid-run to stop and come back to the editor, script intact.
+  See "Block coding" below for the full design.
 - The window title bar doubles as a debug HUD while in edit mode: shows lock
   state, current tool mode, `selected=<part index>`, `drag=<axis>`, and `LMB=` — or,
   while the spawn menu is open, just that.
@@ -147,9 +198,10 @@ editing so the world doesn't drift out from under you.
 ## What's implemented
 
 - **Title screen** (`AppState::TITLE` / `AppState::PLAYING`, gates the top of the main
-  loop with an early `continue`): PLAYGROUND/HILLS pick a `WorldPreset` and rebuild the
-  scene via `resetToPlaygroundScene()`/`resetToHillsScene()`; OPEN calls
-  `TriggerOpenDialog()`. Buttons are ortho-projected quads (`makeQuad()`), hit-tested
+  loop with an early `continue`): PLAYGROUND/HILLS/HILLS+ pick a `WorldPreset` and
+  rebuild the scene via `resetToPlaygroundScene()`/`resetToHillsScene()`/
+  `resetToHillsPlusScene()` (keys `P`/`H`/`J` — `J` since `H` was already taken); OPEN
+  calls `TriggerOpenDialog()`. Buttons are ortho-projected quads (`makeQuad()`), hit-tested
   with a plain screen-space AABB check against `glfwGetCursorPos` (no 3D raycast
   needed, unlike the editor's picking) — note the ortho projection's top-left-origin
   Y-flip also flips triangle winding, so `GL_CULL_FACE` has to be disabled for this
@@ -161,17 +213,26 @@ editing so the world doesn't drift out from under you.
   Playground preset (`g_worldPresetForLoad`) since saved `.retrobitl` files don't carry
   a ground preset yet — only `parts`. Text is a minimal 5x7 bitmap font (`FONT_5X7`)
   drawn as small quads — see Controls above.
-- **World presets** (`WorldPreset::PLAYGROUND` / `WorldPreset::HILLS`, `currentPreset`
+- **World presets** (`WorldPreset::PLAYGROUND` / `HILLS` / `HILLS_PLUS`, `currentPreset`
   in `main()`): Playground is the original flat checkerboard + ramp/pillar scene.
   Hills is procedural rolling terrain (`makeHillTerrain`) — a sine-height-fielded grid
   built once at startup (not regenerated per preset switch), with no boxes. Both the
   render mesh (with finite-difference normals) and its world-space collision triangles
   come from the same generator call, so hills collide via the same
   `resolveSphereVsTriangles` path as props — merged into `propTriangles` only when
-  `currentPreset == HILLS`. The analytic flat ground plane (see below) is Playground-only;
-  Hills has no flat-plane fallback at all, so its terrain triangles are the only thing
-  holding the player up, and walking off the generated grid's edge is a real void-fall,
-  same as walking off the Playground checkerboard.
+  `currentPreset == HILLS`. The analytic flat ground plane (see below) is Playground-only
+  and now infinite; Hills/Hills+ have no flat-plane fallback at all, so their terrain
+  triangles are the only thing holding the player up, and walking off the generated
+  grid's edge is still a real void-fall there (unlike Playground, which no longer has
+  an edge to walk off).
+  **Hills+** (`hillPlusMesh`/`hillPlusTriangles`) is the same generator at a bigger
+  scale — half-size 130 vs. Hills' 60 (~4x the area), segment count scaled up in step
+  (104 vs. 48) so the terrain doesn't get blocky when stretched over more area, and
+  frequency halved (0.06 vs. 0.12) so hills stay similarly-sized bumps rather than
+  shrinking relative to the bigger map. It's a genuinely separate mesh/triangle set
+  built once at startup alongside Hills, not Hills scaled at draw time. Flight mode's
+  arena boundary (see below) also uses a bigger radius on Hills+ (340 vs. 160) so the
+  larger map actually has room to fly around in.
 - **Spawn menu** (`M` in edit mode, `g_spawnMenuOpen`): a small ortho-overlay menu
   (BOX/SPHERE, click or `1`/`2`) for adding new parts without hand-editing code. Reuses
   the same collide-and-slide/gizmo system every other part uses — a spawned part is a
@@ -193,9 +254,34 @@ editing so the world doesn't drift out from under you.
   `glfwGetFramebufferSize` at startup (previously relied on driver defaults)
 - Basic forward-shaded pipeline: `Shader` class, `basic.vert`/`basic.frag` with
   simple diffuse + rim light + exponential-squared fog (the "early 3D playground" look)
+- **2D UI pipeline** (`ui.vert`/`ui.frag`, separate from the 3D shader above): draws
+  rounded rectangles, with an optional puzzle-connector notch, via a signed-distance-
+  field (Inigo Quilez's rounded-box SDF) in the fragment shader — the only way to get
+  real curves/notches out of a quad-only renderer without adding an image/texture
+  pipeline for pre-made sprites. See "Block coding"'s Visual style entry for the full
+  rationale and the `drawRoundedRect`/`drawBlockShape` lambdas it's built on.
 - Flat checkerboard ground (Playground preset only; analytic plane collision at y=0,
-  not real geometry, for perf) — **bounded** to the actual tile area
-  (`GROUND_HALF_EXTENT`), not infinite, so walking off the edge really does drop you
+  not real geometry, for perf) — now genuinely **infinite** (unbounded plane
+  collision, no `GROUND_HALF_EXTENT` clamp). Used to be a `GRID x GRID` loop of
+  individual tile box meshes (`tile.draw()` per tile — 33x33 = 1089 draw calls/frame),
+  bounded to that fixed area since drawing tiles out to any real "infinite" distance
+  wasn't feasible; replaced with a single huge plane mesh (`groundPlane`, half-extent
+  4000) with the checkerboard pattern painted per-fragment in `basic.frag` from
+  world-space position (`uUseCheckerboard`/`uColorB`/`uCheckerSize` uniforms) instead
+  of baked into per-tile vertex colors — one draw call instead of ~1089, and it reads
+  as infinite well past where the old grid's edge used to drop you into the void.
+  `uUseCheckerboard` must be reset to `0` right after the ground draw call (`shader`
+  is reused for every other 3D/UI draw this frame) or every later draw would start
+  painting a checker pattern instead of respecting `uColor` — same footgun class as
+  the earlier `shader.use()`-not-implicit bug, now with a per-draw uniform instead of
+  program binding. `groundPlaneTriangles` (12 triangles — a box's triangle count
+  doesn't grow with its size) gives it real collision geometry too, merged into
+  `propTriangles` for the Playground preset: flight mode only ever collided against
+  `propTriangles` (parts + hills), never the analytic y=0 plane (that only runs in
+  the non-flight branch), so flying low over Playground used to sink straight through
+  with no collision response at all — invisible with the old thin tile grid, obvious
+  once the ground became one big rendered box (screenshot showed the player sphere
+  visibly clipped into the floor).
 - Player: a sphere stand-in for Sonic, with run/accel/friction, gravity, jump
 - Void/respawn: gravity keeps accelerating you down past the level with no floor once
   you're off the ground bounds or through a gap; crossing `VOID_Y` (-20) resets you to
@@ -234,10 +320,15 @@ editing so the world doesn't drift out from under you.
     rotated, and resized parts all collide correctly immediately
 - **Level new/save/open** (`.retrobitl` files): `File > New`/`Save…`/`Open…` in the
   native macOS menu bar, or `Cmd+N`/`Cmd+S`/`Cmd+O`. Save/Open use an
-  `NSSavePanel`/`NSOpenPanel` to write/read the `parts` vector; New has no dialog, it
-  just resets. Format is plain text (`RETROBITLEVEL 1` header, part count, then one
-  line per part: position, size, color, rotation quaternion) — human-readable on
-  purpose, since there's no tooling to inspect a binary format yet.
+  `NSSavePanel`/`NSOpenPanel` to write/read the `parts` vector (and, as of v2, the
+  block script — see "Block coding" below); New has no dialog, it just resets.
+  Format is plain text (`RETROBITLEVEL <version>` header, part count, then one line
+  per part: position, size, color, rotation quaternion, then — version 2+ only —
+  block count and one `<blockType p0 p1 p2>` line per block) — human-readable on
+  purpose, since there's no tooling to inspect a binary format yet. `loadLevelFromFile`
+  only reads the block section `if (version >= 2)`, so pre-existing version-1 files
+  (parts only) still load fine; version 1 also has no block section to reset from, so
+  loading one clears whatever script was already in the editor.
   - `src/platform/macos/NativeMenu.mm` / `include/NativeMenu.h` (see the Platform
     support section below for why this lives under `src/platform/`): GLFW has no
     menu-bar API, so this is hand-written Cocoa (`NSMenu`/`NSMenuItem`/
@@ -262,6 +353,157 @@ editing so the world doesn't drift out from under you.
     raw pointers into `main()`'s locals, set once after each is constructed — needed
     because the native callbacks are plain `void(const char*)` function pointers with
     no way to capture state by reference.
+
+- **Block coding** (`B` in edit mode — see Controls above for the interaction flow).
+  Original plan/rationale: `~/.claude/plans/luminous-bubbling-unicorn.md` (the
+  approved implementation plan the v1 milestone was built from). Explicitly modeled
+  on **TurboWarp** (a fast Scratch 3.0 implementation) — the user's own scripting
+  language, [Retron](https://github.com/RetroGigabyte/Retron), was deliberately set
+  aside for this rather than used, at least for now.
+  - **Data model** (`include/BlockScript.h`, no engine coupling — no `Shader`, no
+    GLFW, no globals): `enum class BlockType` (six blocks — see below), `struct
+    BlockDef` (label/color/param ranges, one static `BLOCK_DEFS[]` array), `struct
+    BlockInstance` (a `BlockType` + up to 3 float params + an indent `depth` — one
+    per block placed in a script), `struct LoopFrame` (a REPEAT's execution state:
+    body start/end index + remaining iterations), and pure layout/hit-test functions
+    (`hitTestPalette`, `hitTestWorkspace`, `workspaceInsertIndexForY`, `findBodyEnd`)
+    so main.cpp's input handling doesn't duplicate geometry/nesting math inline.
+  - **Block set** — colors match Scratch's actual per-category palette (not
+    arbitrary picks): Events yellow, Looks purple, Motion blue, Control orange —
+    including WAIT and REPEAT sharing the exact same orange, since real Scratch's
+    Control category does that too:
+    | Block | Category color | Params | Effect |
+    |---|---|---|---|
+    | WHEN START | Events (yellow) | none | Marks the script's start (visual only — execution always starts at index 0) |
+    | SPAWN BOX / SPAWN SPHERE | Looks (purple) | none | `parts.push_back(...)`, same as the spawn menu |
+    | MOVE LAST PART | Motion (blue) | dx, dy, dz | Offsets `parts.back().position` — operates on the most recent part rather than introducing variables/references |
+    | WAIT | Control (orange) | seconds | Holds the current step for real time (visible since Run switches to `AppState::PLAYING`) |
+    | REPEAT | Control (orange) | count | Loops the blocks nested under it (see Nesting below) |
+
+    **Still deliberately deferred**: variables, custom blocks, multiple
+    scripts/sprites, conditionals, free-text numeric entry (steppers avoid needing
+    a text-input widget, which still doesn't exist anywhere in the engine).
+  - **Nesting (REPEAT) is depth-based, not a containment tree.** Storage is still a
+    **flat** `std::vector<BlockInstance>` — each block just carries an indent `depth`
+    (like Python), and a REPEAT's body is "every immediately following block one
+    depth deeper, until depth drops back to its own or lower" (`findBodyEnd`). Depth
+    is edited with per-block `-`/`+` **indent buttons** (far right of each block),
+    not by dragging a block spatially into a C-shape — implementing real
+    drop-into-container detection was explicitly scoped out as a meaningfully bigger
+    UI problem than indentation buttons, while still giving genuine nested/repeated
+    execution. A block's depth is capped at one more than the block above it (can't
+    nest inside a loop that doesn't visually exist yet) and at `BLOCK_MAX_DEPTH` (3).
+  - **`AppState::BLOCK_EDITOR`** — a third state alongside `TITLE`/`PLAYING`, added
+    to `main.cpp` following the exact shape `TITLE` already established: its own
+    input polling, its own ortho `drawButton`/`drawText` pass, its own `glfwSwapBuffers`
+    + early `continue` that skips the rest of the loop for that frame. Entered/exited
+    via `B` in edit mode; since keyCallback can't reach `appState` directly (it's a
+    `main()`-local, same problem `g_appStateForLoad` solves for Open), `B` just raises
+    `g_toggleBlockEditorRequested`, consumed once per frame near the top of the loop.
+    `enterBlockEditorMode()`/`exitBlockEditorMode()` (lambdas, same shape as
+    `enterPlayMode`) only touch mouse-lock state — no player/camera/parts reset,
+    since opening the editor isn't a level reset.
+  - **Interaction**: palette (left) → click-drag onto the workspace (center) inserts
+    a new `BlockInstance`, landing at the same depth as whatever's above the drop
+    point so dropping mid-run of indented blocks doesn't reset them to top level;
+    drag within the workspace reorders; drag onto the trash zone (bottom) deletes.
+    Per-param `-`/`+` steppers and the indent buttons are both hit-tested *before*
+    treating a click as a block-body drag-start, so tweaking a value or nesting depth
+    doesn't accidentally start a reorder. All of this uses the same per-frame
+    `glfwGetMouseButton` + `WasDown` edge-detect idiom used everywhere else in the
+    engine (title screen, spawn menu, gizmo drag) — no GLFW mouse-button callbacks
+    were added.
+  - **Visual style**: real rounded rectangles with a puzzle-connector notch, via a
+    dedicated SDF shader (`ui.vert`/`ui.frag`, see "2D UI pipeline" above) rather than
+    the flat-quad-plus-overlay-tab hack the first pass used. Two lambdas, defined
+    once alongside `drawButton`/`drawText`:
+    - `drawRoundedRect(x0,y0,x1,y1,color,hovered,radiusPx)` — generic rounded button
+      (steppers, indent buttons, RUN, trash zone, and the title screen/spawn menu
+      buttons, switched over too for a consistent look across every UI screen).
+    - `drawBlockShape(x0,y0,x1,y1,color,hovered,hasTab)` — same, plus the notch, used
+      only for palette entries and workspace blocks (`BLOCK_MAX_DEPTH`-sized radius,
+      fixed tab offset from the left edge).
+    Both switch the active GL program to `uiShader` and set its uniforms (`uColor`,
+    `uHalfSizePx`, `uRadiusPx`, `uHasTab`, `uTabOffsetFromLeftPx`) each call — this
+    surfaced a real bug: `drawButton`/`drawText` (still flat, used for glyph pixels —
+    tiny per-pixel quads would just look like blobs if independently rounded) assumed
+    `shader` stayed the bound GL program for an entire screen's draw calls, which
+    broke the moment a `drawRoundedRect`/`drawBlockShape` call left `uiShader` bound
+    in between. Fixed by having `drawButton` call `shader.use()` itself rather than
+    relying on caller ordering — `Shader::setMat4`/`setVec3`/etc. don't call `use()`,
+    they just target whichever program is currently bound via `glUniform*`, so this is
+    a real footgun for future callers, not just a one-off bug. Also added
+    `Shader::setVec2` for `uHalfSizePx`.
+    Nesting/params still indent from a fixed left edge while staying right-aligned
+    across depths (`workspaceBlockX0(depth)` vs. the depth-independent
+    `workspaceBlockX1()`).
+
+    **Blocks stack flush now (no gap)** — `BlockLayout::WORKSPACE_BLOCK_GAP` is gone
+    entirely, not just set to 0, since the tab/notch only reads as "plugging into"
+    the block above when there's no gap for it to float in. This is what pushed a
+    real layout change: block Y-position stopped being a simple `index * (height +
+    gap)` formula the moment REPEAT needed a **true C-shape** — a left arm
+    (`BlockLayout::ARM_W`, from the REPEAT block down to its closing bar) plus a
+    **bottom closing bar** (`CLOSE_BAR_H`) right after the body, not just a thin
+    spine down the side. The closing bar needs real reserved vertical space that
+    isn't tied to any `BlockInstance`, so per-block Y is now computed once per frame
+    by `computeWorkspaceRowY()` (walks the script, adds `CLOSE_BAR_H` after every
+    REPEAT's body — including stacking multiple bars where nested loops close at the
+    same point) into a `rowY` array that hit-testing (`hitTestWorkspace`,
+    `workspaceInsertIndexForY`) and rendering all index into, instead of each
+    recomputing position independently and risking disagreement. `workspaceBlockY0`/
+    `Y1(index)` were removed rather than left around unused, since they'd compute the
+    wrong (pre-C-shape) position now.
+  - **Execution**: `RUN` sets `scriptRunning = true`, resets `runningStep`/`waitTimer`/
+    `loopStack`, and calls `exitBlockEditorMode()` (switches to `AppState::PLAYING`
+    so the 3D world is visible) — deliberately does **not** clear `g_editMode`, so `B`
+    still works to return to the editor mid-run. A step block placed right after the
+    player-physics section (guarded by `scriptRunning`, not `g_editMode`, since Run
+    intentionally leaves edit mode set) advances `runningStep` through `blockScript`
+    once per frame. Before executing whatever's at `runningStep`, a `while` loop pops/
+    loops any `loopStack` frames whose body has just been reached the end of (a
+    `while`, not `if`, since falling out of one loop can immediately land on its
+    parent's end too) — `REPEAT` itself just pushes a `LoopFrame` and jumps into its
+    body, or skips straight to `findBodyEnd` if the count is 0 or the body is empty.
+    `WAIT` counts `waitTimer` down by `dt` before letting the step advance. Spawn
+    position is a **fixed offset from `playerPos`** (`playerPos + (0, 2, 3)`), not
+    camera-relative — avoids depending on `eyePos`/`camFront`, which aren't computed
+    until later in the frame (the chase-camera section comes after script execution
+    in the loop).
+  - **Save format**: `.retrobitl` is at version 3 now — each block line gained a
+    trailing `depth` column. `loadLevelFromFile` only reads it `if (version >= 3)`,
+    so version-2 files (blocks, no depth) load with every block at depth 0 — exactly
+    what they meant, since v2 predates REPEAT.
+  - **Visually confirmed twice**, both times catching real bugs no amount of
+    compiling clean would have found:
+    1. Flat-rectangle v1 pass — layout logic (palette, workspace stack, steppers,
+       indent buttons, trash zone, REPEAT with its param) positioned sensibly.
+    2. Rounded-rect pass — **segfaulted** the instant a block was placed. Root
+       cause: `rowY` (per-block Y positions, from `computeWorkspaceRowY`) was
+       computed once at the top of the frame, but the drag-release handling later
+       that same frame could insert/erase into `blockScript`, changing its size.
+       The render loop right after iterates `blockScript.size()` and indexes
+       `rowY[i]` — with `blockScript` now bigger than the `rowY` it was computed
+       from, that's an out-of-bounds `std::vector` read. Fixed by recomputing
+       `rowY = computeWorkspaceRowY(blockScript)` again immediately after the
+       insert/erase logic, before rendering uses it. The lesson: any per-frame
+       array derived from `blockScript` needs recomputing after *every* point in
+       the frame that can resize it, not just once at the top.
+    That same round also surfaced two real overflow bugs once actually seen:
+    `drawText` only takes a **center** point, not a left edge, so a long label
+    like "MOVE LAST PART" — anchored at a fixed offset that assumed shorter text —
+    overflowed past its own block's **left** edge into whatever sat before it
+    (visible as text bleeding between the palette and workspace columns). And the
+    per-param value text (`"%.1f"`) sat in a slot only 36px wide, narrower than
+    worst-case text like `"-5.0"`, so the `+` button (drawn after it) silently
+    painted over the trailing digit — `"1.0"` rendered as `"1."`. Fixed by adding
+    `textWidthPx()` so labels can be properly left-anchored (`leftEdge +
+    width/2`), and by widening the per-param slot (`PARAM_SLOT_W`/
+    `PARAM_PLUS_OFFSET`) and `WORKSPACE_BLOCK_W` (520→620) so text has real room
+    regardless of how many digits/minus signs a value has. Block/palette label
+    text also switched to white (was dark 0.05, illegible-ish against Scratch's
+    actual saturated category colors) — matches real Scratch, which uses white
+    text on every block regardless of category.
 
 ## Known issues / rough edges
 
@@ -302,10 +544,29 @@ editing so the world doesn't drift out from under you.
 
 ## Next steps (not started)
 
-1. Curved terrain / loop geometry — the actual "Sonic Xtreme" signature move. Will need
-   either a spline-based mesh generator or hand-authored curved meshes, fed into the same
-   `buildBoxTriangles`-style triangle list the collision resolver already consumes.
-2. Scratch-style block coding layer — not started. Whatever scripting/gameplay-logic API
+1. Scratch-style block coding layer — not started. Whatever scripting/gameplay-logic API
    gets built for this should be planned as a clean boundary now rather than retrofitted.
-3. Address the rough edges above (hover feedback, unlit gizmo shader, undo/cancel) if
+2. Address the rough edges above (hover feedback, unlit gizmo shader, undo/cancel) if
    the tool starts feeling hard to use as more parts get added.
+3. Tune/playtest the loop track (see "Loop track" below) — radius, width, and run
+   speed haven't been validated against each other yet.
+
+## Loop track (Playground preset)
+
+The actual "Sonic Xtreme" signature move — a curved vertical loop, `makeLoopTrack()`,
+Playground-only, centered at `(LOOP_CENTER_X, 0, LOOP_CENTER_Z)` = `(30, 0, 0)` with
+radius 7 and half-width 3.5, built once at startup like the ground plane/hills. It's a
+thin ribbon (2 rows across the width, swept around a circle in the X-Y plane, 48
+segments), not a full tube — resolving collision against it works because
+`resolveSphereVsTriangles` derives its push-out normal purely from `(sphere center -
+closest point on triangle)`, not triangle winding, so a zero-thickness ribbon acts as
+real two-sided collision geometry, same as the ribbon-like hill terrain. Parametrized
+so `theta=0` sits at ground level with zero slope (`dy/dtheta = R*sin(0) = 0`) —
+tangent to the flat ground, so it needs no separate entry/exit ramp; you just run
+straight onto it from the Playground checkerboard. Getting around the loop relies on
+having enough speed when you hit the bottom (same principle as a marble staying in a
+curved pipe via normal force from the collide-and-slide resolver) — radius 7 against
+`RUN_SPEED = 9`/`GRAVITY = -28` hasn't actually been playtested, so the numbers may
+need tuning if it doesn't complete the loop in practice. Triangles are merged into
+`propTriangles` for the Playground preset (same block as `groundPlaneTriangles`), and
+it draws as a flat steel-grey ribbon right after the ground plane.

@@ -12,6 +12,7 @@ public:
     void use() const;
     void setMat4(const std::string& name, const glm::mat4& m) const;
     void setVec3(const std::string& name, const glm::vec3& v) const;
+    void setVec2(const std::string& name, const glm::vec2& v) const;
     void setFloat(const std::string& name, float f) const;
     void setInt(const std::string& name, int i) const;
 
