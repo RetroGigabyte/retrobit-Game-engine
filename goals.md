@@ -6,8 +6,34 @@ for what's actually implemented today.
 
 ## Near-term
 
+- U-turn (`U`, flight mode) is now a smooth animated 180 turn (`g_yaw` eased over 0.7s
+  via smoothstep) instead of an instant snap — the instant version force-reversed
+  velocity and hard-cut the camera to avoid a visible swirl, which read as too
+  abrupt/mechanical. The animated version needs neither hack: existing per-frame
+  steering physics (`playerVel` blending toward `camFront * FLIGHT_SPEED`) naturally
+  arcs the ship around as `g_yaw` rotates, and the camera's normal easing tracks it
+  since `playerPos` never jumps. Guarded against retriggering mid-turn. Also had to
+  make the U-turn count as "steering" for the fast velocity blend rate — otherwise
+  playerVel couldn't keep pace with the rotating camFront and the path came out as a
+  sharp-cornered L instead of a smooth U (user: "that is more of an L-turn"). User
+  clarified further: "the plane goes up and rotates to go back" — added a pitch-up
+  hump (peaks mid-turn, lands back level) and a full 360 roll (reusing the barrel
+  roll's camFront-axis up-vector rotation) on top of the yaw animation, so it's an
+  actual climbing flip maneuver instead of a flat spin.
+- Fixed a real bug: barrel roll (double-tap A/D) could retrigger mid-roll, since
+  tapping A/D repeatedly to steer (encouraged by the forceful turn tuning) often
+  satisfies the double-tap window on nearly every tap. Each retrigger reset the roll
+  before it finished, flipping the camera upside-down over and over — reported by the
+  user as the screen "keeps going up and down." Fixed by guarding the trigger on
+  `barrelRollTimer <= 0`.
 - Sprint (`E`, normal walk mode) — flat 1.6x speed multiplier on `RUN_SPEED`. Reuses
   `E` from flight mode's boost since the two modes are mutually exclusive.
+- Flight mode's arena boundary is now a wraparound (Asteroids-style) instead of a
+  push-back — flying past the edge teleports you to the opposite side with velocity
+  untouched, reading as an infinite loop of space rather than bouncing off a solid
+  wall (which is how the old push-back + cancel-outward-velocity version read). The
+  chase camera also snaps instantly on wrap, same fix as U-turn, for the same reason
+  (`playerPos` jumps clear across the arena in one frame).
 
 - **Infinite Playground ground** — the checkerboard used to be a bounded `GRID x GRID`
   loop of individual tile meshes (1089 draw calls/frame, and walking past its edge

@@ -773,8 +773,9 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         g_flightMode = !g_flightMode; // edit mode already has its own freecam flight
     }
     if (key == GLFW_KEY_U && action == GLFW_PRESS && g_flightMode) {
-        g_yaw += 180.0f;
-        if (g_yaw > 180.0f) g_yaw -= 360.0f;
+        // g_yaw itself isn't touched here anymore — the main loop animates it
+        // smoothly over U_TURN_DURATION instead of snapping it, so this just raises
+        // the flag (like g_toggleBlockEditorRequested) to start that animation.
         g_uTurnRequested = true;
     }
 #ifdef __APPLE__
@@ -1014,6 +1015,24 @@ int main() {
     // in rather than hitting the same boundary a much smaller map would use.
     const float FLIGHT_ARENA_RADIUS = 160.0f;
     const float FLIGHT_ARENA_RADIUS_HILLS_PLUS = 340.0f;
+    // U-turn (U): used to snap g_yaw 180 degrees instantly and reverse velocity to
+    // match, with the chase camera hard-cut to its new spot so it wouldn't visibly
+    // swirl across the map. That read as too abrupt/mechanical — a "normal" turn
+    // instead animates g_yaw smoothly over U_TURN_DURATION and lets the existing
+    // per-frame steering (playerVel blending toward camFront * FLIGHT_SPEED each
+    // frame) carry the ship around as its facing rotates, exactly like a real turn
+    // rather than a flip-and-reverse. No camera hard-cut needed anymore either,
+    // since position never jumps — only facing direction animates.
+    float uTurnTimer = 0.0f;      // counts down from U_TURN_DURATION while active
+    float uTurnStartYaw = 0.0f;
+    float uTurnTargetYaw = 0.0f;
+    float uTurnStartPitch = 0.0f;
+    const float U_TURN_DURATION = 0.7f;
+    // "the plane goes up and rotates to go back" — a pitch-up hump (peaks mid-turn,
+    // back to level by the end) plus a full roll flourish layered on top of the yaw
+    // animation above, so it reads as an actual climbing flip maneuver instead of
+    // just spinning in place on a flat plane.
+    const float U_TURN_PITCH_BUMP = 55.0f;
 
     glm::vec3 freeCamPos(0.0f);
     glm::vec3 initCamFront(
@@ -1612,14 +1631,29 @@ int main() {
             playerVel = glm::vec3(0.0f); // don't carry momentum across the mode switch
             wasFlightMode = g_flightMode;
         }
-        bool justUTurned = false;
+        bool justWrapped = false; // set below when the arena wraparound teleports playerPos
         if (g_uTurnRequested) {
-            // g_yaw already flipped 180 in keyCallback (so camFront below reflects it
-            // this same frame) — flip existing velocity to match instead of leaving it
-            // pointed the old way while target velocity catches up over ACCEL time.
-            playerVel = -playerVel;
             g_uTurnRequested = false;
-            justUTurned = true;
+            if (uTurnTimer <= 0.0f) { // ignore U while a turn's already animating
+                uTurnStartYaw = g_yaw;
+                uTurnTargetYaw = g_yaw + 180.0f;
+                uTurnStartPitch = g_pitch;
+                uTurnTimer = U_TURN_DURATION;
+            }
+        }
+        if (uTurnTimer > 0.0f) {
+            uTurnTimer = glm::max(0.0f, uTurnTimer - dt);
+            float progress = 1.0f - (uTurnTimer / U_TURN_DURATION);
+            float eased = progress * progress * (3.0f - 2.0f * progress); // smoothstep
+            g_yaw = glm::mix(uTurnStartYaw, uTurnTargetYaw, eased);
+            // Pitch hump: 0 at both ends, peaks at the midpoint — climbs into the turn
+            // and levels back out by the time it's facing the other way.
+            g_pitch = uTurnStartPitch + sinf(progress * (float)M_PI) * U_TURN_PITCH_BUMP;
+            if (uTurnTimer <= 0.0f) {
+                if (g_yaw > 180.0f) g_yaw -= 360.0f;
+                else if (g_yaw < -180.0f) g_yaw += 360.0f;
+                g_pitch = uTurnStartPitch; // land exactly level again, no drift
+            }
         }
 
         glm::vec3 moveDir(0.0f);
@@ -1659,18 +1693,23 @@ int main() {
 
             // Barrel roll: detect double-tap A/D (edge-triggered on key-down within
             // BARREL_ROLL_TAP_WINDOW of the previous tap), starts a timed cosmetic roll.
+            // Guarded against retriggering mid-roll (barrelRollTimer > 0) — without
+            // this, steering by tapping A/D repeatedly (which the forceful turn speed/
+            // accel tuning encourages over long holds) could satisfy the double-tap
+            // window on nearly every tap, resetting the roll again before it finished
+            // and flipping the camera upside-down over and over instead of once.
             bool aDownFlight = glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS;
             bool dDownFlight = glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
             double nowT = glfwGetTime();
             if (aDownFlight && !aWasDownFlight) {
-                if (nowT - lastATapTime < BARREL_ROLL_TAP_WINDOW) {
+                if (barrelRollTimer <= 0.0f && nowT - lastATapTime < BARREL_ROLL_TAP_WINDOW) {
                     barrelRollTimer = BARREL_ROLL_DURATION;
                     barrelRollDir = -1.0f;
                 }
                 lastATapTime = nowT;
             }
             if (dDownFlight && !dWasDownFlight) {
-                if (nowT - lastDTapTime < BARREL_ROLL_TAP_WINDOW) {
+                if (barrelRollTimer <= 0.0f && nowT - lastDTapTime < BARREL_ROLL_TAP_WINDOW) {
                     barrelRollTimer = BARREL_ROLL_DURATION;
                     barrelRollDir = 1.0f;
                 }
@@ -1696,13 +1735,19 @@ int main() {
             const float FLIGHT_STRAFE_SPEED = 34.0f;   // was 8, then 20 — still not forceful enough
             const float FLIGHT_FAST_ACCEL = 140.0f;    // was 90 (turn-only) — snappier than forward's ACCEL (40)
             glm::vec3 target = camFront * FLIGHT_SPEED * flightSpeedMul;
-            bool steering = false;
+            // U-turn counts as steering too — without this, playerVel (blending at
+            // the slow base ACCEL) couldn't keep up with camFront rotating smoothly
+            // through the turn, so it kept mostly coasting in the old direction until
+            // late in the animation then yanked over — a sharp-cornered "L" path
+            // instead of a continuous "U" arc that actually follows the turning nose.
+            bool steering = uTurnTimer > 0.0f;
             if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) { target += glm::vec3(0, 1, 0) * FLIGHT_VERTICAL_SPEED; steering = true; }
             if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) { target -= glm::vec3(0, 1, 0) * FLIGHT_VERTICAL_SPEED; steering = true; }
             if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) { target += camRight * FLIGHT_STRAFE_SPEED; steering = true; }
             if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) { target -= camRight * FLIGHT_STRAFE_SPEED; steering = true; }
-            // Steering (W/S/A/D held) blends in faster than forward alone so it
-            // responds immediately instead of slowly ramping up like the rest of flight.
+            // Steering (W/S/A/D held, or a U-turn animating) blends in faster than
+            // forward alone so it responds immediately instead of slowly ramping up
+            // like the rest of flight.
             float blendRate = steering ? FLIGHT_FAST_ACCEL : ACCEL;
             playerVel += (target - playerVel) * glm::min(blendRate * dt, 1.0f);
             glm::vec2 flatDir(target.x, target.z);
@@ -1762,16 +1807,19 @@ int main() {
                 onGround = false;
                 resolveSphereVsTriangles(playerPos, playerVel, PLAYER_RADIUS, propTriangles);
 
-                // Arena boundary (StarFox 64 All-Range Mode-style): flying too far
-                // from spawn pushes you back rather than allowing infinite freeflight.
+                // Arena wraparound (Asteroids-style): flying past the boundary
+                // teleports you to the opposite side instead of bouncing you off an
+                // invisible wall — used to push back + cancel outward velocity, which
+                // felt like colliding with a solid ball out there. Velocity is left
+                // untouched, so you keep flying the same direction and just re-enter
+                // from the far edge, giving the illusion of an infinite loop of space
+                // rather than a bounded arena.
                 float arenaRadius = (currentPreset == WorldPreset::HILLS_PLUS) ? FLIGHT_ARENA_RADIUS_HILLS_PLUS : FLIGHT_ARENA_RADIUS;
                 glm::vec3 fromSpawn = playerPos - SPAWN_POS;
                 float distFromSpawn = glm::length(fromSpawn);
                 if (distFromSpawn > arenaRadius) {
-                    glm::vec3 inward = -fromSpawn / distFromSpawn;
-                    playerPos = SPAWN_POS + fromSpawn * (arenaRadius / distFromSpawn);
-                    float outwardSpeed = glm::dot(playerVel, -inward);
-                    if (outwardSpeed > 0.0f) playerVel += inward * outwardSpeed; // cancel outward component
+                    playerPos = SPAWN_POS - fromSpawn; // reappear on the opposite side
+                    justWrapped = true;
                 }
             } else {
                 bool spaceDown = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
@@ -1903,12 +1951,13 @@ int main() {
             float clampedDist = glm::max(freeDist - CAM_MARGIN, CAM_MIN_DIST);
             glm::vec3 desiredCamPos = lookTarget + camDir * clampedDist;
 
-            if (justUTurned) {
-                // Without this, the chase cam would ease from "behind old direction"
-                // to "behind new direction" over ~1s, arcing wildly across/through the
-                // world since idealOffset flipped 180 instantly — that swing read as
-                // the player's position itself getting reset. Cut straight to the new
-                // spot instead, same as a hard scene cut.
+            if (justWrapped) {
+                // playerPos jumps clear across the arena in one frame on wraparound —
+                // the normal ease below would visibly swirl the camera across the
+                // whole map trying to catch up, so cut straight to the new spot
+                // instead, same as a hard scene cut. U-turn no longer needs this: it
+                // animates g_yaw smoothly now instead of snapping it, so playerPos
+                // never jumps and the normal ease below tracks it fine.
                 camPos = desiredCamPos;
             } else {
                 // snap in fast when something's obstructing (avoid clipping), ease out otherwise
@@ -1943,13 +1992,20 @@ int main() {
         }
 
         // Roll the up vector around camFront for flight-mode banking + barrel rolls
-        // (steady bank from camRoll, plus a full 360 spin while a barrel roll plays).
+        // (steady bank from camRoll, plus a full 360 spin while a barrel roll plays,
+        // plus a full roll flourish while a U-turn is animating — see U_TURN_PITCH_BUMP's
+        // comment for why: "goes up and rotates to go back" needs both the pitch hump
+        // above and this roll, not just a flat yaw spin).
         glm::vec3 camUp(0, 1, 0);
         if (g_flightMode && !g_editMode) {
             float totalRollDeg = camRoll;
             if (barrelRollTimer > 0.0f) {
                 float rollProgress = 1.0f - (barrelRollTimer / BARREL_ROLL_DURATION);
                 totalRollDeg += barrelRollDir * 360.0f * rollProgress;
+            }
+            if (uTurnTimer > 0.0f) {
+                float uTurnProgress = 1.0f - (uTurnTimer / U_TURN_DURATION);
+                totalRollDeg += 360.0f * uTurnProgress;
             }
             camUp = glm::rotate(glm::mat4(1.0f), glm::radians(totalRollDeg), camFront) * glm::vec4(camUp, 0.0f);
         }

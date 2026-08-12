@@ -135,21 +135,52 @@ ortho overlay with hand-rolled button rectangles and a minimal 5x7 bitmap font
     (macOS commonly grabs a held Ctrl for Mission Control/Spaces switching,
     which yanks focus from the app mid-flight and looks like a crash).
   - Double-tap `A` or `D` — **barrel roll**: a quick cosmetic 360 camera roll,
-    purely visual (doesn't affect movement/collision).
+    purely visual (doesn't affect movement/collision). Guarded against
+    retriggering mid-roll (`barrelRollTimer > 0`) — without that guard, tapping
+    A/D repeatedly to steer (which the forceful turn speed/accel below
+    encourages over long holds) could satisfy the double-tap window on nearly
+    every tap, resetting the roll before it finished and flipping the camera
+    upside-down repeatedly instead of once (reported by the user as "it keeps
+    going up and down").
   - Holding `A`/`D` also **banks the camera** into the turn (rolls toward level
     again when released) instead of staying perfectly level — this is a camera
     roll only since RETRObit is first-person with no visible ship model.
-  - **Arena boundary**: flying more than 160 units from spawn pushes you back
-    inward instead of allowing infinite freeflight, echoing All-Range Mode's
-    bounded play area.
-  - `U` — **U-turn**: instantly flips `g_yaw` 180 degrees and reverses current
-    velocity to match, so you're immediately flying back the way you came
-    instead of coasting through a slow turn. `playerPos` itself is never
-    touched — but the chase camera used to ease from "behind the old
-    direction" to "behind the new one" over about a second, arcing wildly
-    across/through the world since the ideal camera offset flipped instantly;
-    that swing read as the player getting reset. Fixed by snapping the camera
-    straight to its new spot on the u-turn's frame instead of easing.
+  - **Arena wraparound**: flying more than 160 units from spawn (340 on Hills+)
+    teleports you to the opposite side of the arena, Asteroids-style, instead of
+    an infinite unbounded flight zone. Used to push you back inward and cancel
+    the outward velocity component instead, which read as bouncing off an
+    invisible solid ball out there; wraparound keeps velocity untouched, so you
+    keep flying the same direction and just re-enter from the far edge — reads
+    as looping space rather than hitting a wall. The chase camera snaps straight
+    to its new spot on the wrap, since `playerPos` jumps clear across the arena
+    in one frame and the normal easing camera can't keep up with a teleport.
+  - `U` — **U-turn**: animates `g_yaw` smoothly 180 degrees over `U_TURN_DURATION`
+    (0.7s, eased with smoothstep) instead of snapping it instantly. Used to be an
+    instant flip (`g_yaw += 180` in one frame) with `playerVel` force-reversed to
+    match and the chase camera hard-cut to its new spot (since a real 180 flip in
+    one frame made the normally-easing camera swirl wildly across the map) — that
+    read as too abrupt/mechanical for what's supposed to be a turn. The animated
+    version needs no velocity hack or camera hard-cut at all: `playerVel` already
+    blends toward `camFront * FLIGHT_SPEED` every frame (see the steering code
+    above), so as `g_yaw` rotates, the ship arcs around under the same physics a
+    normal turn uses, and the chase camera's regular per-frame easing tracks it
+    fine since `playerPos` never jumps. Guarded against retriggering mid-turn
+    (`uTurnTimer > 0`), same guard style as the barrel roll fix above. Also counts
+    as "steering" for the fast velocity blend rate (`FLIGHT_FAST_ACCEL`) — without
+    that, `playerVel` (blending at the slow base `ACCEL`) couldn't keep up with
+    `camFront` rotating smoothly through the turn, so it mostly coasted in the old
+    direction until late in the animation then yanked over: a sharp-cornered
+    L-shaped path instead of a continuous U-shaped arc that actually follows the
+    turning nose (reported by the user as "that is more of an L-turn"). The
+    user then clarified what an actual U-turn should look like: "the plane
+    goes up and rotates to go back" — a climbing flip, not a flat spin. Added
+    two more layers on top of the yaw animation, both zero at each end and
+    peaking mid-turn: a pitch-up hump (`g_pitch += sin(progress*pi) *
+    U_TURN_PITCH_BUMP`, 55 degrees, landing back exactly on the start pitch —
+    no drift) for "goes up", and a full 360 roll (reusing the same
+    `camFront`-axis up-vector rotation the barrel roll already uses) for
+    "rotates". `g_pitch` bypasses its usual mouse-look clamp during this since
+    it's a direct animation, not user input.
 - `Esc` — toggle mouse capture
 - `/` — enter the edit tool (see below)
 - `Q` — quit
